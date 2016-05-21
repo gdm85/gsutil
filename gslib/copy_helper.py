@@ -221,7 +221,7 @@ GZIP_ALL_FILES = 'GZIP_ALL_FILES'
 # file.
 TRACKERFILE_UPDATE_THRESHOLD = TEN_MIB
 
-PARALLEL_COMPOSITE_SUGGESTION_THRESHOLD = 150 * 1024 * 1024
+PARALLEL_COMPOSITE_SUGGESTION_THRESHOLD = 0
 
 # S3 requires special Multipart upload logic (that we currently don't implement)
 # for files > 5GiB in size.
@@ -1077,7 +1077,7 @@ def _ShouldDoParallelCompositeUpload(logger, allow_splitting, src_url, dst_url,
   # TODO: Once compiled crcmod is being distributed by major Linux distributions
   # remove this check.
   if (all_factors_but_size and parallel_composite_upload_threshold == 0
-      and file_size >= PARALLEL_COMPOSITE_SUGGESTION_THRESHOLD):
+      and PARALLEL_COMPOSITE_SUGGESTION_THRESHOLD != 0 and file_size >= PARALLEL_COMPOSITE_SUGGESTION_THRESHOLD):
     with suggested_sliced_transfers_lock:
       if not suggested_sliced_transfers.get('suggested'):
         logger.info('\n'.join(textwrap.wrap(
@@ -1800,6 +1800,7 @@ def _ShouldDoSlicedDownload(download_strategy, src_obj_metadata,
       and src_obj_metadata.size >= sliced_object_download_threshold)
 
   if (not use_slice
+      and PARALLEL_COMPOSITE_SUGGESTION_THRESHOLD != 0
       and src_obj_metadata.size >= PARALLEL_COMPOSITE_SUGGESTION_THRESHOLD
       and not UsingCrcmodExtension(crcmod)
       and check_hashes_config != CHECK_HASH_NEVER):
