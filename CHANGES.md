@@ -1,3 +1,149 @@
+Release 4.23 (release date: 2017-03-09)
+=======================================
+Bug Fixes
+------------------
+- Fixed "referenced before assignment" error in some copy_helper exceptions for
+  resumable uploads and non-resumable cloud-to-local downloads.
+- The setmeta command now properly supports case sensitivity in custom metadata
+  keys when using the JSON API.
+- Fixed a resource leak affecting Windows in cases where single-process,
+  multithreaded parallelism is used that would result in an OSError with the
+  message "Too many open files".
+- Fixed HTTPError initialization failure in signurl command.
+- Fixed signurl issue where attempting to validate short-lived URLs on a slow
+  connection would fail because of URL expiration.
+- Fixed a bug where cp -r would not properly resolve wildcards for
+  cloud-to-cloud copies.
+- Fixed a bug where cp -e -r would copy symlinks.
+- Fixed a bug where cp -P would fail on Windows.
+- Fixed a bug where version -l might not show all boto configuration files.
+- Running perfdiag now only lists the objects that were created by that run of
+  perfdiag. This fixes an issue where running perfdiag against an existing
+  bucket with many objects in it could take a long time.
+
+
+Other Changes
+------------------
+- Simplified parallelism when using a single process with multiple threads.
+  With this change, gsutil will spawn a new thread pool per level of
+  parallelism. As an example, if you specify that you want a
+  parellel_thread_count of 24, this will result in 24 worker threads, except
+  when you're using parallel composite uploads or sliced downloads, in which
+  case 48 (24 * 2) worker threads will be used.
+- Extended the early deletion warning threshold when moving Coldline objects
+  to 90 days after object creation.
+- Improved several error messages and warnings.
+- Several documentation updates and clarifications.
+
+Release 4.22 (release date: 2016-10-20)
+=======================================
+New features
+------------------
+- Added per-object storage class functionality to gsutil. For more details, see
+  https://cloud.google.com/storage/docs/per-object-storage-class.
+- Added the defstorageclass command, which can be used to get and set an
+  existing bucket's default storage class.
+- The cp, mv, and rewrite commands now support the "-s" option, allowing users
+  to specify the storage class for destination object(s). When no storage class
+  is specified, the object's storage class will be assigned from either its
+  bucket's default storage class (cp/mv commands) or the source object's
+  storage class (rewrite command).
+
+Bug Fixes
+------------------
+- Fixed a bug in POSIX preservation for the cp and mv commands where POSIX
+  attributes were not propagated to cloud objects, even when the -P flag was
+  present.
+- Fixed a bug in setmeta where removing custom metadata would add an
+  empty-string value if the key did not already exist.
+- Content-Type is now obtained from symlink targets, rather than symlinks
+  themselves, when the use_magicfile option is set in the .boto configuration
+  file.
+
+Other Changes
+------------------
+- Analytics reporting now includes performance metrics such as average
+  throughput and thread idle time.
+- The iam set command now supports a -e option to specify an etag precondition
+  check. The IAM policy file returned by iam get and used by iam set has also
+  been altered to include this field.
+- Default limit for max number of processes changed to 64.
+- Several documentation updates and clarifications.
+
+Release 4.21 (release date: 2016-08-16)
+=======================================
+New Features
+------------------
+- The console output for many commands has been improved to display
+  command progress.
+- The cp, mv, and rsync commands now support a -P option that preserves
+  POSIX file attributes from the source. Currently, mode, gid, uid,
+  atime, and mtime attributes are supported for uploads, downloads,
+  and copies.
+- gsutil can now optionally report anonymous usage statistics that help
+  gsutil developers improve the tool. For non-gcloud distributions,
+  prompts have been added to the config and update commands. Prompts can
+  be disabled via the disable_analytics_prompt value in the .boto
+  configuration file.
+- Added the iam commmand, which can be used to set IAM policies on
+  Google Cloud Storage buckets and objects. This feature is currently in
+  alpha and requires a whitelist application to use it - see
+  "gsutil help iam" for  details.
+- The hash command now supports retrieving hashes for cloud objects.
+
+Bug Fixes
+------------------
+- Fixed a bug where rsync -e -r could fail for subdirectories with
+  broken symlinks.
+- Fixed an access error when interacting with S3 user-specific
+  directories.
+
+Other Changes
+------------------
+- Updated boto library dependency to 2.42.0.
+
+Release 4.20 (release date: 2016-07-20)
+=======================================
+New Features
+------------------
+- gsutil now outputs a message that estimates the total number of objects for
+  commands affecting more than 30,000 objects. This value can be adjusted via
+  task_estimation_threshold in the .boto configuration file.
+
+Bug Fixes
+------------------
+- Fixed a bug in resumable downloads that could raise UnboundLocalError if
+  the download file was not readable.
+- Updated oauth2client to version 2.2.0, fixing some IOError and OSError cases.
+- Fixed bug in gsutil ls that would show update time instead of creation
+  time when using the JSON API and -L or -l flags.
+- Fixed a bug in gsutil rsync -d that could cause erroneous removal of
+  an extra destination object.
+- Fixed downloads to include accept-encoding:gzip logic when appropriate.
+
+Other Changes
+------------------
+- gsutil rsync now stores modification time (mtime) for cloud objects.
+- Changed the default change detection algorithm of gsutil rsync from file
+  size to file mtime, falling back to checksum and finally file
+  size as alternatives. This allows for increased accuracy of rsync without
+  the speed sacrifice that comes from checksum calculation, and makes gsutil
+  rsync work more similarly to how Linux rsync works. Note that the first
+  run of a local-to-cloud rsync using this new algorithm may be slower than
+  subsequent runs, as the cloud objects will not initially have an mtime, and
+  the algorithm will fall back to the slower checksum-based alternative in
+  addition to adding mtime to the cloud objects.
+- When using the JSON API, gsutil will output a progress message before
+  retrying a request if enough time has passed since the first attempt.
+- Improved error detection in dry runs of gsutil rsync by attempting to open
+  files that would be copied.
+- Added time created and time updated properties to output of gsutil ls -Lb.
+- Added archived time property to output of gsutil ls -La and gsutil stat.
+- Changed minimum number of source objects for gsutil compose from 2 to 1.
+- Removed an HTTP metadata get call from cp, acl, and setmeta commands. This
+  improves the speed of gsutil cp for small objects by over 50%.
+- Several documentation updates and clarifications.
+
 Release 4.19 (release date: 2016-04-13)
 =======================================
 Deprecation Notice

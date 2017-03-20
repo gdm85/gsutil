@@ -32,11 +32,10 @@ import webbrowser
 
 import boto
 from boto.provider import Provider
-from httplib2 import ServerNotFoundError
-from oauth2client.client import HAS_CRYPTO
 
 import gslib
 from gslib.command import Command
+from gslib.command import DEFAULT_TASK_ESTIMATION_THRESHOLD
 from gslib.commands.compose import MAX_COMPONENT_COUNT
 from gslib.cred_types import CredTypes
 from gslib.exception import AbortException
@@ -45,9 +44,13 @@ from gslib.hashing_helper import CHECK_HASH_ALWAYS
 from gslib.hashing_helper import CHECK_HASH_IF_FAST_ELSE_FAIL
 from gslib.hashing_helper import CHECK_HASH_IF_FAST_ELSE_SKIP
 from gslib.hashing_helper import CHECK_HASH_NEVER
+from gslib.metrics import CheckAndMaybePromptForAnalyticsEnabling
 from gslib.sig_handling import RegisterSignalHandler
-from gslib.util import EIGHT_MIB
 from gslib.util import IS_WINDOWS
+from gslib.util import RESUMABLE_THRESHOLD_B
+
+from httplib2 import ServerNotFoundError
+from oauth2client.client import HAS_CRYPTO
 
 
 _SYNOPSIS = """
@@ -102,7 +105,7 @@ _DETAILED_HELP_TEXT = ("""
   When you run gsutil config -e, you will be prompted for your service account
   email address and the path to your private key file. To get this data,
   follow the instructions on
-  `Service Accounts <https://developers.google.com/console/help/new/#serviceaccounts>`_.
+  `Service Accounts <https://cloud.google.com/storage/docs/authentication#generating-a-private-key>`_.
 
   Note that your service account will NOT be considered an Owner for the
   purposes of API access (see "gsutil help creds" for more information about
@@ -142,10 +145,12 @@ _DETAILED_HELP_TEXT = ("""
 
 
 <B>ADDITIONAL CONFIGURATION-CONTROLLABLE FEATURES</B>
-  With the exception of setting up gsutil to work through a proxy (see
-  below), most users won't need to edit values in the boto configuration file;
-  values found in there tend to be of more specialized use than command line
-  option-controllable features.
+  With the exception of setting up gsutil to work through a proxy, most users
+  won't need to edit values in the boto configuration file; values found in
+  the file tend to be of more specialized use than command line
+  option-controllable features. For information on setting up gsutil to work
+  through a proxy, see the comments preceding the proxy settings in your
+  .boto file.
 
   The following are the currently defined configuration settings, broken
   down by section. Their use is documented in comments preceding each, in
@@ -180,12 +185,16 @@ _DETAILED_HELP_TEXT = ("""
       max_retry_delay
       num_retries
 
+    [GoogleCompute]
+      service_account
+
     [GSUtil]
       check_hashes
       content_language
       decryption_key1 ... 100
       default_api_version
       default_project_id
+      disable_analytics_prompt
       encryption_key
       json_api_version
       parallel_composite_upload_component_size
@@ -203,6 +212,7 @@ _DETAILED_HELP_TEXT = ("""
       state_dir
       tab_completion_time_logs
       tab_completion_timeout
+      task_estimation_threshold
       use_magicfile
 
     [OAuth2]
@@ -286,11 +296,19 @@ CONFIG_PRELUDE_CONTENT = """
 # processes on a typical multi-core Linux computer, to avoid being too
 # aggressive with resources, the default number of threads is reduced from
 # the previous value of 24 to 5.
+#
+# We also cap the maximum number of default processes at 32. Since each level
+# of recursion depth gets its own process pool, this means a maximum of
+# 64 processes with the current maximum recursion depth of 2.  We limit this
+# number because testing with more than 200 processes showed fatal locking
+# exceptions in Python's multiprocessing.Manager. More processes are
+# probably not needed to saturate most networks.
+#
 # On Windows and Mac systems parallel multi-processing and multi-threading
 # in Python presents various challenges so we retain compatibility with
 # the established parallel mode operation, i.e. one process and 24 threads.
 if platform.system() == 'Linux':
-  DEFAULT_PARALLEL_PROCESS_COUNT = multiprocessing.cpu_count()
+  DEFAULT_PARALLEL_PROCESS_COUNT = min(multiprocessing.cpu_count(), 32)
   DEFAULT_PARALLEL_THREAD_COUNT = 5
 else:
   DEFAULT_PARALLEL_PROCESS_COUNT = 1
@@ -350,6 +368,16 @@ https_validate_certificates = True
 # Note: At present this value only impacts the XML API and the JSON API uses a
 # fixed value of 60.
 #max_retry_delay = <integer value>
+"""
+
+CONFIG_GOOGLECOMPUTE_SECTION_CONTENT = """
+[GoogleCompute]
+
+# 'service_account' specifies the a Google Compute Engine service account to
+# use for credentials. This value is intended for use only on Google Compute
+# Engine virtual machines and usually lives in /etc/boto.cfg. Most users
+# shouldn't need to edit this part of the config.
+#service_account = default
 """
 
 CONFIG_INPUTLESS_GSUTIL_SECTION_CONTENT = """
@@ -439,9 +467,9 @@ CONFIG_INPUTLESS_GSUTIL_SECTION_CONTENT = """
 # that is done we will re-enable parallel composite uploads by default in
 # gsutil.
 #
-# Note: Parallel composite uploads should not be used with NEARLINE storage
-# class buckets, as doing this would incur an early deletion charge for each
-# component object.
+# Note: Parallel composite uploads should not be used with NEARLINE or COLDLINE
+# storage class buckets, as doing this incurs an early deletion charge for
+# each component object.
 #parallel_composite_upload_threshold = %(parallel_composite_upload_threshold)s
 #parallel_composite_upload_component_size = %(parallel_composite_upload_component_size)s
 
@@ -454,6 +482,14 @@ CONFIG_INPUTLESS_GSUTIL_SECTION_CONTENT = """
 #sliced_object_download_threshold = %(sliced_object_download_threshold)s
 #sliced_object_download_component_size = %(sliced_object_download_component_size)s
 #sliced_object_download_max_components = %(sliced_object_download_max_components)s
+
+# 'task_estimation_threshold' controls how many files or objects gsutil
+# processes before it attempts to estimate the total work that will be
+# performed by the command. Estimation makes extra directory listing or API
+# list calls and is performed only if multiple processes and/or threads are
+# used. Estimation can slightly increase cost due to extra
+# listing calls; to disable it entirely, set this value to 0.
+#task_estimation_threshold=%(task_estimation_threshold)s
 
 # 'use_magicfile' specifies if the 'file --mime-type <filename>' command should
 # be used to guess content types instead of the default filename extension-based
@@ -518,11 +554,14 @@ content_language = en
 #prefer_api = json
 #prefer_api = xml
 
+# Disables the prompt asking for opt-in to data collection for analytics.
+#disable_analytics_prompt = True
+
 """ % {'hash_fast_else_fail': CHECK_HASH_IF_FAST_ELSE_FAIL,
        'hash_fast_else_skip': CHECK_HASH_IF_FAST_ELSE_SKIP,
        'hash_always': CHECK_HASH_ALWAYS,
        'hash_never': CHECK_HASH_NEVER,
-       'resumable_threshold': EIGHT_MIB,
+       'resumable_threshold': RESUMABLE_THRESHOLD_B,
        'parallel_process_count': DEFAULT_PARALLEL_PROCESS_COUNT,
        'parallel_thread_count': DEFAULT_PARALLEL_THREAD_COUNT,
        'parallel_composite_upload_threshold': (
@@ -535,7 +574,8 @@ content_language = en
            DEFAULT_PARALLEL_COMPOSITE_UPLOAD_COMPONENT_SIZE),
        'sliced_object_download_max_components': (
            DEFAULT_SLICED_OBJECT_DOWNLOAD_MAX_COMPONENTS),
-       'max_component_count': MAX_COMPONENT_COUNT}
+       'max_component_count': MAX_COMPONENT_COUNT,
+       'task_estimation_threshold': DEFAULT_TASK_ESTIMATION_THRESHOLD}
 
 CONFIG_OAUTH2_CONFIG_CONTENT = """
 [OAuth2]
@@ -963,6 +1003,9 @@ class ConfigCommand(Command):
     config_file.write('%s\n' % CONFIG_BOTO_SECTION_CONTENT)
     self._WriteProxyConfigFileSection(config_file)
 
+    # Write the Google Compute Engine section.
+    config_file.write(CONFIG_GOOGLECOMPUTE_SECTION_CONTENT)
+
     # Write the config file GSUtil section that doesn't depend on user input.
     config_file.write(CONFIG_INPUTLESS_GSUTIL_SECTION_CONTENT)
 
@@ -1020,6 +1063,8 @@ class ConfigCommand(Command):
             'by the\nls and mb commands; please try again.')
       config_file.write('%sdefault_project_id = %s\n\n\n' %
                         (project_id_section_prelude, default_project_id))
+
+      CheckAndMaybePromptForAnalyticsEnabling()
 
     # Write the config file OAuth2 section that doesn't depend on user input.
     config_file.write(CONFIG_OAUTH2_CONFIG_CONTENT)

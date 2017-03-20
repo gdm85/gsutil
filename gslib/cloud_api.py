@@ -26,14 +26,16 @@ class CloudApi(object):
   a separate instance of the gsutil Cloud API should be instantiated per-thread.
   """
 
-  def __init__(self, bucket_storage_uri_class, logger, provider=None,
-               debug=0, trace_token=None, perf_trace_token=None):
+  def __init__(self, bucket_storage_uri_class, logger, status_queue,
+               provider=None, debug=0, trace_token=None,
+               perf_trace_token=None):
     """Performs necessary setup for interacting with the cloud storage provider.
 
     Args:
       bucket_storage_uri_class: boto storage_uri class, used by APIs that
                                 provide boto translation or mocking.
       logger: logging.logger for outputting log messages.
+      status_queue: Queue for relaying status to UI.
       provider: Default provider prefix describing cloud storage provider to
                 connect to.
       debug: Debug level for the API implementation (0..3).
@@ -43,6 +45,7 @@ class CloudApi(object):
     """
     self.bucket_storage_uri_class = bucket_storage_uri_class
     self.logger = logger
+    self.status_queue = status_queue
     self.provider = provider
     self.debug = debug
     self.trace_token = trace_token
@@ -66,6 +69,42 @@ class CloudApi(object):
       Bucket object.
     """
     raise NotImplementedError('GetBucket must be overloaded')
+
+  def GetBucketIamPolicy(self, bucket_name, provider=None, fields=None):
+    """Returns an IAM policy for the specified Bucket.
+
+    Args:
+      bucket_name: Name of the bucket.
+      provider: Cloud storage provider to connect to.  If not present,
+                class-wide default is used.
+      fields: If present, return only the IAM policy fields specified.
+
+    Raises:
+      ArgumentException for errors during input validation.
+      ServiceException for errors interacting with the cloud storage providers.
+
+    Returns:
+      Policy object of the bucket.
+    """
+    raise NotImplementedError('GetBucketIamPolicy must be overloaded')
+
+  def SetBucketIamPolicy(self, bucket_name, policy, provider=None):
+    """Sets an IAM policy for the specified Bucket.
+
+    Args:
+      bucket_name: Name of the bucket.
+      policy: A Policy object describing the IAM policy.
+      provider: Cloud storage provider to connect to.  If not present,
+                class-wide default is used.
+
+    Raises:
+      ArgumentException for errors during input validation.
+      ServiceException for errors interacting with the cloud storage providers.
+
+    Returns:
+      Policy object of the bucket. May differ from input Policy.
+    """
+    raise NotImplementedError('SetBucketIamPolicy must be overloaded')
 
   def ListBuckets(self, project_id=None, provider=None, fields=None):
     """Lists bucket metadata for the given project.
@@ -203,6 +242,48 @@ class CloudApi(object):
       Iterator over CsObjectOrPrefix wrapper class.
     """
     raise NotImplementedError('ListObjects must be overloaded')
+
+  def GetObjectIamPolicy(self, bucket_name, object_name, generation=None,
+                         provider=None, fields=None):
+    """Gets IAM policy for specified Object.
+
+    Args:
+      bucket_name: Bucket containing the object.
+      object_name: Name of the object.
+      generation: Generation of the object to retrieve.
+      provider: Cloud storage provider to connect to.  If not present,
+                class-wide default is used.
+      fields: If present, return only the IAM policy fields specified.
+
+    Raises:
+      ArgumentException for errors during input validation.
+      ServiceException for errors interacting with cloud storage providers.
+
+    Returns:
+      Object IAM policy.
+    """
+    raise NotImplementedError('GetObjectIamPolicy must be overloaded')
+
+  def SetObjectIamPolicy(self, bucket_name, object_name, policy,
+                         generation=None, provider=None):
+    """Sets IAM policy for specified Object.
+
+    Args:
+      bucket_name: Bucket containing the object.
+      object_name: Name of the object.
+      policy: IAM Policy object.
+      generation: Generation of the object to which the IAM policy will apply.
+      provider: Cloud storage provider to connect to. If not present,
+                class-wide default is used.
+
+    Raises:
+      ArgumentException for errors during input validation.
+      ServiceException for errors interacting with cloud storage providers.
+
+    Returns:
+      Policy object of the object. May differ from input Policy.
+    """
+    raise NotImplementedError('SetObjectIamPolicy must be overloaded')
 
   def GetObjectMetadata(self, bucket_name, object_name, generation=None,
                         provider=None, fields=None):

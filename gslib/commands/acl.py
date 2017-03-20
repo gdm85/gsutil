@@ -16,7 +16,9 @@
 
 from __future__ import absolute_import
 
+from apitools.base.py import encoding
 from gslib import aclhelpers
+from gslib import metrics
 from gslib.cloud_api import AccessDeniedException
 from gslib.cloud_api import BadRequestException
 from gslib.cloud_api import Preconditions
@@ -50,7 +52,7 @@ _CH_SYNOPSIS = """
     -u <id|email>:<perm>
     -g <id|email|domain|All|AllAuth>:<perm>
     -p <viewers|editors|owners>-<project number>
-    -d <id|email|domain|All|AllAuth>
+    -d <id|email|domain|All|AllAuth|<viewers|editors|owners>-<project number>>
 """
 
 _GET_DESCRIPTION = """
@@ -395,8 +397,9 @@ class AclCommand(Command):
               self.command_name))
 
     self.everything_set_okay = True
-    self.ApplyAclFunc(_ApplyAclChangesWrapper, _ApplyExceptionHandler,
-                      self.args)
+    self.ApplyAclFunc(
+        _ApplyAclChangesWrapper, _ApplyExceptionHandler,
+        self.args, object_fields=['acl', 'generation', 'metageneration'])
     if not self.everything_set_okay:
       raise CommandException('ACLs for some objects could not be set.')
 
@@ -425,10 +428,8 @@ class AclCommand(Command):
                                     fields=['acl', 'metageneration'])
       current_acl = bucket.acl
     elif url.IsObject():
-      gcs_object = gsutil_api.GetObjectMetadata(
-          url.bucket_name, url.object_name, provider=url.scheme,
-          generation=url.generation,
-          fields=['acl', 'generation', 'metageneration'])
+      gcs_object = encoding.JsonToMessage(apitools_messages.Object,
+                                          name_expansion_result.expanded_result)
       current_acl = gcs_object.acl
     if not current_acl:
       self._RaiseForAccessDenied(url)
@@ -455,7 +456,7 @@ class AclCommand(Command):
         gsutil_api.PatchObjectMetadata(
             url.bucket_name, url.object_name, object_metadata,
             preconditions=preconditions, provider=url.scheme,
-            generation=url.generation)
+            generation=url.generation, fields=['id'])
     except BadRequestException as e:
       # Don't retry on bad requests, e.g. invalid email address.
       raise CommandException('Received bad request from server: %s' % str(e))
@@ -468,12 +469,19 @@ class AclCommand(Command):
     """Command entry point for the acl command."""
     action_subcommand = self.args.pop(0)
     self.ParseSubOpts(check_args=True)
+
+    # Commands with both suboptions and subcommands need to reparse for
+    # suboptions, so we log again.
+    metrics.LogCommandParams(sub_opts=self.sub_opts)
     self.def_acl = False
     if action_subcommand == 'get':
+      metrics.LogCommandParams(subcommands=[action_subcommand])
       self.GetAndPrintAcl(self.args[0])
     elif action_subcommand == 'set':
+      metrics.LogCommandParams(subcommands=[action_subcommand])
       self._SetAcl()
     elif action_subcommand in ('ch', 'change'):
+      metrics.LogCommandParams(subcommands=[action_subcommand])
       self._ChAcl()
     else:
       raise CommandException(('Invalid subcommand "%s" for the %s command.\n'

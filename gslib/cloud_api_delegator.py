@@ -42,7 +42,8 @@ class CloudApiDelegator(CloudApi):
   """
 
   def __init__(self, bucket_storage_uri_class, gsutil_api_map, logger,
-               provider=None, debug=0, trace_token=None, perf_trace_token=None):
+               status_queue, provider=None, debug=0, trace_token=None,
+               perf_trace_token=None):
     """Performs necessary setup for delegating cloud storage requests.
 
     This function has different arguments than the gsutil Cloud API __init__
@@ -54,6 +55,7 @@ class CloudApiDelegator(CloudApi):
       gsutil_api_map: Map of providers and API selector tuples to api classes
                       which can be used to communicate with those providers.
       logger: logging.logger for outputting log messages.
+      status_queue: Queue for relaying status to UI.
       provider: Default provider prefix describing cloud storage provider to
                 connect to.
       debug: Debug level for the API implementation (0..3).
@@ -61,6 +63,7 @@ class CloudApiDelegator(CloudApi):
       perf_trace_token: Performance trace token to use when making API calls.
     """
     super(CloudApiDelegator, self).__init__(bucket_storage_uri_class, logger,
+                                            status_queue,
                                             provider=provider, debug=debug,
                                             trace_token=trace_token,
                                             perf_trace_token=perf_trace_token)
@@ -120,6 +123,7 @@ class CloudApiDelegator(CloudApi):
         self.api_map[ApiMapConstants.API_MAP][provider][api_selector](
             self.bucket_storage_uri_class,
             self.logger,
+            self.status_queue,
             provider=provider,
             debug=self.debug,
             trace_token=self.trace_token,
@@ -180,10 +184,11 @@ class CloudApiDelegator(CloudApi):
     # every HTTP call.
     elif using_gs_hmac:
       api = ApiSelector.XML
-    # Customer-supplied encryption keys are only supported in the JSON API.
-    # We can't stop XML API users from interacting with encrypted objects,
-    # since we don't know the object is encrypted until after the API call is
-    # made, but if they specify configuration values we will use JSON.
+    # Customer-supplied encryption keys are currently only supported in the
+    # JSON API implementation (GcsJsonApi). We can't stop XML API users from
+    # interacting with encrypted objects, since we don't know the object is
+    # encrypted until after the API call is made, but if they specify
+    # configuration values we will use JSON.
     elif configured_encryption:
       api = ApiSelector.JSON
     # Try to force the user's preference to a supported API.
@@ -195,6 +200,12 @@ class CloudApiDelegator(CloudApi):
   # For function docstrings, see CloudApi class.
   def GetBucket(self, bucket_name, provider=None, fields=None):
     return self._GetApi(provider).GetBucket(bucket_name, fields=fields)
+
+  def GetBucketIamPolicy(self, bucket_name, provider=None, fields=None):
+    return self._GetApi(provider).GetBucketIamPolicy(bucket_name, fields=fields)
+
+  def SetBucketIamPolicy(self, bucket_name, policy, provider=None):
+    return self._GetApi(provider).SetBucketIamPolicy(bucket_name, policy)
 
   def ListBuckets(self, project_id=None, provider=None, fields=None):
     return self._GetApi(provider).ListBuckets(project_id=project_id,
@@ -216,6 +227,16 @@ class CloudApiDelegator(CloudApi):
   def DeleteBucket(self, bucket_name, preconditions=None, provider=None):
     return self._GetApi(provider).DeleteBucket(bucket_name,
                                                preconditions=preconditions)
+
+  def GetObjectIamPolicy(self, bucket_name, object_name,
+                         generation=None, provider=None, fields=None):
+    return self._GetApi(provider).GetObjectIamPolicy(
+        bucket_name, object_name, generation, fields=fields)
+
+  def SetObjectIamPolicy(self, bucket_name, object_name, policy,
+                         generation=None, provider=None):
+    return self._GetApi(provider).SetObjectIamPolicy(
+        bucket_name, object_name, policy, generation)
 
   def ListObjects(self, bucket_name, prefix=None, delimiter=None,
                   all_versions=None, provider=None, fields=None):

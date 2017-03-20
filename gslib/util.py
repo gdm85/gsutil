@@ -17,6 +17,8 @@
 from __future__ import absolute_import
 
 import collections
+from datetime import timedelta
+from datetime import tzinfo
 import errno
 import locale
 import logging
@@ -30,8 +32,11 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import traceback
 import xml.etree.ElementTree as ElementTree
+
+from apitools.base.py import http_wrapper
 
 import boto
 from boto import config
@@ -44,6 +49,8 @@ from boto.pyami.config import BotoConfigLocations
 import gslib
 from gslib.exception import CommandException
 from gslib.storage_url import StorageUrlFromString
+from gslib.third_party.storage_apitools import storage_v1_messages as apitools_messages
+from gslib.thread_message import RetryableErrorMessage
 from gslib.translation_helper import AclTranslation
 from gslib.translation_helper import GenerationFromUrlAndString
 from gslib.translation_helper import S3_ACL_MARKER_GUID
@@ -96,6 +103,8 @@ EIGHT_MIB = 8 * ONE_MIB
 TEN_MIB = 10 * ONE_MIB
 DEFAULT_FILE_BUFFER_SIZE = 8 * ONE_KIB
 _DEFAULT_LINES = 25
+RESUMABLE_THRESHOLD_MIB = 8
+RESUMABLE_THRESHOLD_B = RESUMABLE_THRESHOLD_MIB * ONE_MIB
 
 # By default, the timeout for SSL read errors is infinite. This could
 # cause gsutil to hang on network disconnect, so pick a more reasonable
@@ -105,7 +114,7 @@ SSL_TIMEOUT = 60
 # Start with a progress callback every 64 KiB during uploads/downloads (JSON
 # API). Callback implementation should back off until it hits the maximum size
 # so that callbacks do not create huge amounts of log output.
-START_CALLBACK_PER_BYTES = 1024*64
+START_CALLBACK_PER_BYTES = 1024*256
 MAX_CALLBACK_PER_BYTES = 1024*1024*100
 
 # Upload/download files in 8 KiB chunks over the HTTP connection.
@@ -113,6 +122,9 @@ TRANSFER_BUFFER_SIZE = 1024*8
 
 # Default number of progress callbacks during transfer (XML API).
 XML_PROGRESS_CALLBACKS = 10
+
+# Number of objects to request in listing calls.
+NUM_OBJECTS_PER_LIST_PAGE = 1000
 
 # For files >= this size, output a message indicating that we're running an
 # operation on the file (like hashing or gzipping) so it does not appear to the
@@ -136,6 +148,17 @@ _EXP_STRINGS = [
     (60, 'EiB', 'Eibit', 'E'),
 ]
 
+_EXP_TEN_STRING = [
+    (3, 'k'),
+    (6, 'm'),
+    (9, 'b'),
+    (12, 't'),
+    (15, 'q')
+]
+# Number of seconds to wait before printing a long retry warning message.
+LONG_RETRY_WARN_SEC = 10
+
+SECONDS_PER_DAY = 86400L
 
 global manager  # pylint: disable=global-at-module-level
 certs_file_lock = threading.Lock()
@@ -174,6 +197,136 @@ Retry = retry_decorator.retry  # pylint: disable=invalid-name
 cached_multiprocessing_is_available = None
 cached_multiprocessing_is_available_stack_trace = None
 cached_multiprocessing_is_available_message = None
+
+
+# This function used to belong inside of update.py. However, it needed to be
+# moved here due to compatibility issues with Travis CI, because update.py is
+# not included with PyPI installations.
+def DisallowUpdateIfDataInGsutilDir(directory=gslib.GSUTIL_DIR):
+  """Disallows the update command if files not in the gsutil distro are found.
+
+  This prevents users from losing data if they are in the habit of running
+  gsutil from the gsutil directory and leaving data in that directory.
+
+  This will also detect someone attempting to run gsutil update from a git
+  repo, since the top-level directory will contain git files and dirs (like
+  .git) that are not distributed with gsutil.
+
+  Args:
+    directory: The directory to use this functionality on.
+
+  Raises:
+    CommandException: if files other than those distributed with gsutil found.
+  """
+  # Manifest includes recursive-includes of gslib. Directly add
+  # those to the list here so we will skip them in os.listdir() loop without
+  # having to build deeper handling of the MANIFEST file here. Also include
+  # 'third_party', which isn't present in manifest but gets added to the
+  # gsutil distro by the gsutil submodule configuration; and the MANIFEST.in
+  # and CHANGES.md files.
+  manifest_lines = ['MANIFEST.in', 'third_party']
+
+  try:
+    with open(os.path.join(directory, 'MANIFEST.in'), 'r') as fp:
+      for line in fp:
+        if line.startswith('include '):
+          manifest_lines.append(line.split()[-1])
+        elif re.match(r'recursive-include \w+ \*', line):
+          manifest_lines.append(line.split()[1])
+  except IOError:
+    logging.getLogger().warn('MANIFEST.in not found in %s.\nSkipping user data '
+                             'check.\n', directory)
+    return
+
+  # Look just at top-level directory. We don't try to catch data dropped into
+  # subdirs (like gslib) because that would require deeper parsing of
+  # MANFFEST.in, and most users who drop data into gsutil dir do so at the top
+  # level directory.
+  for filename in os.listdir(directory):
+    if (filename.endswith('.pyc') or filename == '__pycache__'
+        or filename == '.travis.yml'):
+      # Ignore compiled code and travis config.
+      continue
+    if filename not in manifest_lines:
+      raise CommandException('\n'.join(textwrap.wrap(
+          'A file (%s) that is not distributed with gsutil was found in '
+          'the gsutil directory. The update command cannot run with user '
+          'data in the gsutil directory.' %
+          os.path.join(gslib.GSUTIL_DIR, filename))))
+
+
+# This class is necessary to convert timestamps to UTC. By default Python
+# datetime objects are timezone unaware. This created problems when interacting
+# with cloud object timestamps which are timezone aware. This issue appeared
+# when handling the timeCreated metadata attribute. The values returned by the
+# service were placed in RFC 3339 format in the storage_v1_messages module. RFC
+# 3339 requires a timezone in any timestamp. This caused problems as the
+# datetime object elsewhere in the code was timezone unaware and was different
+# by exactly one hour. The main problem is because the local system uses
+# daylight savings time which consequently adjusted the timestamp ahead by one
+# hour.
+class UTC(tzinfo):
+  """Timezone information class used to convert datetime timestamps to UTC."""
+
+  def utcoffset(self, _):
+    """An offset of the number of minutes away from UTC this tzinfo object is.
+
+    Returns:
+      A time duration of zero. UTC is zero minutes away from UTC.
+    """
+    return timedelta(0)
+
+  def tzname(self, _):
+    """A method to retrieve the name of this timezone object.
+
+    Returns:
+      The name of the timezone (i.e. 'UTC').
+    """
+    return 'UTC'
+
+  def dst(self, _):
+    """A fixed offset to handle daylight savings time (DST).
+
+    Returns:
+      A time duration of zero as UTC does not use DST.
+    """
+    return timedelta(0)
+
+
+class LazyWrapper(object):
+  """Wrapper for lazily instantiated objects."""
+
+  def __init__(self, func):
+    """The init method for LazyWrapper.
+
+    Args:
+      func: A function (lambda or otherwise) to lazily evaluate.
+    """
+    self._func = func
+
+  def __call__(self):
+    """The call method for a LazyWrapper object."""
+    try:
+      return self._value
+    except AttributeError:
+      self._value = self._func()
+      return self._value
+
+  def __len__(self):
+    """The len method for a LazyWrapper object."""
+    try:
+      return len(self._value)
+    except AttributeError:
+      self.__call__()
+      return len(self._value)
+
+  def __iter__(self):
+    """The iter method for a LazyWrapper object."""
+    try:
+      return self._value.__iter__()
+    except AttributeError:
+      self.__call__()
+      return self._value.__iter__()
 
 
 # Enum class for specifying listing style.
@@ -267,6 +420,63 @@ def CreateDirIfNeeded(dir_path, mode=0777):
         raise
 
 
+def GetDiskCounters():
+  """Retrieves disk I/O statistics for all disks.
+
+  Adapted from the psutil module's psutil._pslinux.disk_io_counters:
+    http://code.google.com/p/psutil/source/browse/trunk/psutil/_pslinux.py
+
+  Originally distributed under under a BSD license.
+  Original Copyright (c) 2009, Jay Loden, Dave Daeschler, Giampaolo Rodola.
+
+  Returns:
+    A dictionary containing disk names mapped to the disk counters from
+    /disk/diskstats.
+  """
+  # iostat documentation states that sectors are equivalent with blocks and
+  # have a size of 512 bytes since 2.4 kernels. This value is needed to
+  # calculate the amount of disk I/O in bytes.
+  sector_size = 512
+
+  partitions = []
+  with open('/proc/partitions', 'r') as f:
+    lines = f.readlines()[2:]
+    for line in lines:
+      _, _, _, name = line.split()
+      if name[-1].isdigit():
+        partitions.append(name)
+
+  retdict = {}
+  with open('/proc/diskstats', 'r') as f:
+    for line in f:
+      values = line.split()[:11]
+      _, _, name, reads, _, rbytes, rtime, writes, _, wbytes, wtime = values
+      if name in partitions:
+        rbytes = int(rbytes) * sector_size
+        wbytes = int(wbytes) * sector_size
+        reads = int(reads)
+        writes = int(writes)
+        rtime = int(rtime)
+        wtime = int(wtime)
+        retdict[name] = (reads, writes, rbytes, wbytes, rtime, wtime)
+  return retdict
+
+
+def CalculateThroughput(total_bytes_transferred, total_elapsed_time):
+  """Calculates throughput and checks for a small total_elapsed_time.
+
+  Args:
+    total_bytes_transferred: Total bytes transferred in a period of time.
+    total_elapsed_time: The amount of time elapsed in seconds.
+
+  Returns:
+    The throughput as a float.
+  """
+  if total_elapsed_time < 0.01:
+    total_elapsed_time = 0.01
+  return float(total_bytes_transferred) / float(total_elapsed_time)
+
+
 def DivideAndCeil(dividend, divisor):
   """Returns ceil(dividend / divisor).
 
@@ -304,6 +514,27 @@ def GetGsutilStateDir():
       os.path.expanduser(os.path.join('~', '.gsutil')))
   CreateDirIfNeeded(config_file_dir)
   return config_file_dir
+
+
+def GetGsutilClientIdAndSecret():
+  """Returns a tuple of the gsutil OAuth2 client ID and secret.
+
+  Google OAuth2 clients always have a secret, even if the client is an installed
+  application/utility such as gsutil.  Of course, in such cases the "secret" is
+  actually publicly known; security depends entirely on the secrecy of refresh
+  tokens, which effectively become bearer tokens.
+
+  Returns:
+    Tuple of strings (client ID, secret).
+  """
+
+  if os.environ.get('CLOUDSDK_WRAPPER') == '1':
+    # Cloud SDK installs have a separate client ID / secret.
+    return ('32555940559.apps.googleusercontent.com',  # Cloud SDK client ID
+            'ZmssLNjJy2998hD4CTg2ejr2')                # Cloud SDK secret
+
+  return ('909320924072.apps.googleusercontent.com',   # gsutil client ID
+          'p3RlpR10xMFh9ZXBS/ZNLYUu')                  # gsutil secret
 
 
 def GetCredentialStoreFilename():
@@ -412,16 +643,26 @@ def ConfigureNoOpAuthIfNeeded():
       from gslib import no_op_auth_plugin  # pylint: disable=unused-variable
 
 
-def GetConfigFilePath():
-  config_path = 'no config found'
+def GetConfigFilePaths():
+  """Returns a list of the path(s) to the boto config file(s) to be loaded."""
+  config_paths = []
+  # The only case in which we load multiple boto configurations is
+  # when the BOTO_CONFIG environment variable is not set and the
+  # BOTO_PATH environment variable is set with multiple path values.
+  # Otherwise, we stop when we find the first readable config file.
+  # This predicate was taken from the boto.pyami.config module.
+  should_look_for_multiple_configs = (
+      'BOTO_CONFIG' not in os.environ and
+      'BOTO_PATH' in os.environ)
   for path in BotoConfigLocations:
     try:
       with open(path, 'r'):
-        config_path = path
-      break
+        config_paths.append(path)
+        if not should_look_for_multiple_configs:
+          break
     except IOError:
       pass
-  return config_path
+  return config_paths
 
 
 def GetBotoConfigFileList():
@@ -449,6 +690,12 @@ def GetCertsFile():
     string filename of the certs file to use.
   """
   certs_file = boto.config.get('Boto', 'ca_certificates_file', None)
+  # The 'system' keyword indicates to use the system installed certs. Some
+  # Linux distributions patch the stack such that the Python SSL
+  # infrastructure picks up the system installed certs by default, thus no
+  #  action necessary on our part
+  if certs_file == 'system':
+    return None
   if not certs_file:
     with certs_file_lock:
       if configured_certs_files:
@@ -573,7 +820,7 @@ def JsonResumableChunkSizeDefined():
 
 def _RoundToNearestExponent(num):
   i = 0
-  while i+1 < len(_EXP_STRINGS) and num >= (2 ** _EXP_STRINGS[i+1][0]):
+  while i + 1 < len(_EXP_STRINGS) and num >= (2 ** _EXP_STRINGS[i+1][0]):
     i += 1
   return i, round(float(num) / 2 ** _EXP_STRINGS[i][0], 2)
 
@@ -626,6 +873,77 @@ def HumanReadableToBytes(human_string):
   raise ValueError('Invalid byte string specified: %s' % human_string)
 
 
+def DecimalShort(num):
+  """Creates a shorter string version for a given number of objects.
+
+  Args:
+    num: The number of objects to be shortened.
+  Returns:
+    shortened string version for this number. It takes the largest
+    scale (thousand, million or billion) smaller than the number and divides it
+    by that scale, indicated by a suffix with one decimal place. This will thus
+    create a string of at most 6 characters, assuming num < 10^18.
+    Example: 123456789 => 123.4m
+  """
+  for divisor_exp, suffix in reversed(_EXP_TEN_STRING):
+    if num >= 10**divisor_exp:
+      quotient = '%.1lf' % (float(num) / 10**divisor_exp)
+      return quotient + suffix
+  return str(num)
+
+
+def PrettyTime(remaining_time):
+  """Creates a standard version for a given remaining time in seconds.
+
+  Created over using strftime because strftime seems to be
+    more suitable for a datetime object, rather than just a number of
+    seconds remaining.
+  Args:
+    remaining_time: The number of seconds remaining as a float, or a
+      string/None value indicating time was not correctly calculated.
+  Returns:
+    if remaining_time is a valid float, %H:%M:%D time remaining format with
+    the nearest integer from remaining_time (%H might be higher than 23).
+    Else, it returns the same message it received.
+  """
+  remaining_time = int(round(remaining_time))
+  hours = int(remaining_time / 3600)
+  if hours >= 100:
+    # Too large to display with precision of minutes and seconds.
+    # If over 1000, saying 999+ hours should be enough.
+    return '%d+ hrs' % min(hours, 999)
+  remaining_time -= (3600 * hours)
+  minutes = int(remaining_time / 60)
+  remaining_time -= (60 * minutes)
+  seconds = int(remaining_time)
+  return (str('%02d' % hours) + ':' + str('%02d' % minutes)+':' +
+          str('%02d' % seconds))
+
+
+def HumanReadableWithDecimalPlaces(number, decimal_places=1):
+  """Creates a human readable format for bytes with fixed decimal places.
+
+  Args:
+    number: The number of bytes.
+    decimal_places: The number of decimal places.
+  Returns:
+    String representing a readable format for number with decimal_places
+     decimal places.
+  """
+  number_format = MakeHumanReadable(number).split()
+  num = str(int(round(10**decimal_places * float(number_format[0]))))
+  if num == '0':
+    number_format[0] = ('0' + (('.' + ('0' * decimal_places)) if decimal_places
+                               else ''))
+  else:
+    num_length = len(num)
+    if decimal_places:
+      num = (num[:num_length-decimal_places] + '.' +
+             num[num_length-decimal_places:])
+    number_format[0] = num
+  return ' '.join(number_format)
+
+
 def Percentile(values, percent, key=lambda x: x):
   """Find the percentile of a list of values.
 
@@ -648,13 +966,13 @@ def Percentile(values, percent, key=lambda x: x):
   c = math.ceil(k)
   if f == c:
     return key(values[int(k)])
-  d0 = key(values[int(f)]) * (c-k)
-  d1 = key(values[int(c)]) * (k-f)
+  d0 = key(values[int(f)]) * (c - k)
+  d1 = key(values[int(c)]) * (k - f)
   return d0 + d1
 
 
 def RemoveCRLFFromString(input_str):
-  """Returns the input string with all \\n and \\r removed."""
+  r"""Returns the input string with all \n and \r removed."""
   return re.sub(r'[\r\n]', '', input_str)
 
 
@@ -708,6 +1026,15 @@ def LookUpGsutilVersion(gsutil_api, url_str):
           return prop.value
 
 
+class DiscardMessagesQueue(object):
+  """Emulates a Cloud API status queue but drops all messages."""
+
+  # pylint: disable=invalid-name, unused-argument
+  def put(self, message=None, timeout=None):
+    pass
+  # pylint: enable=invalid-name, unused-argument
+
+
 def GetGsutilVersionModifiedTime():
   """Returns unix timestamp of when the VERSION file was last modified."""
   if not gslib.VERSION_FILE:
@@ -734,6 +1061,56 @@ BOTO_IS_SECURE = _BotoIsSecure()
 
 def ResumableThreshold():
   return config.getint('GSUtil', 'resumable_threshold', EIGHT_MIB)
+
+
+def CreateCustomMetadata(entries=None, custom_metadata=None):
+  """Creates a custom metadata (apitools Object.MetadataValue) object.
+
+  Inserts the key/value pairs in entries.
+
+  Args:
+    entries: The dictionary containing key/value pairs to insert into metadata.
+    custom_metadata: A pre-existing custom metadata object to add to.
+
+  Returns:
+    An apitools Object.MetadataVlue.
+  """
+  if custom_metadata is None:
+    custom_metadata = apitools_messages.Object.MetadataValue(
+        additionalProperties=[])
+  if entries is None:
+    entries = {}
+  for key, value in entries.iteritems():
+    custom_metadata.additionalProperties.append(
+        apitools_messages.Object.MetadataValue.AdditionalProperty(
+            key=str(key), value=str(value)))
+  return custom_metadata
+
+
+def GetValueFromObjectCustomMetadata(obj_metadata, search_key,
+                                     default_value=None):
+  """Filters a specific element out of an object's custom metadata.
+
+  Args:
+    obj_metadata: The metadata for an object.
+    search_key: The custom metadata key to search for.
+    default_value: The default value to use for the key if it cannot be found.
+
+  Returns:
+    A tuple indicating if the value could be found in metadata and a value
+    corresponding to search_key. The value at the specified key in custom
+    metadata or the default value, if the specified key does not exist in the
+    customer metadata.
+  """
+  try:
+    value = next((attr.value for attr in
+                  obj_metadata.metadata.additionalProperties
+                  if attr.key == search_key), None)
+    if value is None:
+      return False, default_value
+    return True, value
+  except AttributeError:
+    return False, default_value
 
 
 # pylint: disable=too-many-statements
@@ -766,21 +1143,30 @@ def PrintFullInfoAboutObject(bucket_listing_ref, incl_acl=True):
     num_objs = 1
 
   print '%s:' % url_str.encode(UTF8)
+  if obj.timeCreated:
+    print MakeMetadataLine(
+        'Creation time', obj.timeCreated.strftime('%a, %d %b %Y %H:%M:%S GMT'))
   if obj.updated:
-    print '\tCreation time:\t\t%s' % obj.updated.strftime(
-        '%a, %d %b %Y %H:%M:%S GMT')
+    print MakeMetadataLine(
+        'Update time', obj.updated.strftime('%a, %d %b %Y %H:%M:%S GMT'))
+  if obj.storageClass:
+    print MakeMetadataLine('Storage class', obj.storageClass)
   if obj.cacheControl:
-    print '\tCache-Control:\t\t%s' % obj.cacheControl
+    print MakeMetadataLine('Cache-Control', obj.cacheControl)
   if obj.contentDisposition:
-    print '\tContent-Disposition:\t\t%s' % obj.contentDisposition
+    print MakeMetadataLine('Content-Disposition', obj.contentDisposition)
   if obj.contentEncoding:
-    print '\tContent-Encoding:\t\t%s' % obj.contentEncoding
+    print MakeMetadataLine('Content-Encoding', obj.contentEncoding)
   if obj.contentLanguage:
-    print '\tContent-Language:\t%s' % obj.contentLanguage
-  print '\tContent-Length:\t\t%s' % obj.size
-  print '\tContent-Type:\t\t%s' % obj.contentType
+    print MakeMetadataLine('Content-Language', obj.contentLanguage)
+  print MakeMetadataLine('Content-Length', obj.size)
+  print MakeMetadataLine('Content-Type', obj.contentType)
   if obj.componentCount:
-    print '\tComponent-Count:\t%d' % obj.componentCount
+    print MakeMetadataLine('Component-Count', obj.componentCount)
+  if obj.timeDeleted:
+    print MakeMetadataLine(
+        'Archived time',
+        obj.timeDeleted.strftime('%a, %d %b %Y %H:%M:%S GMT'))
   marker_props = {}
   if obj.metadata and obj.metadata.additionalProperties:
     non_marker_props = []
@@ -790,36 +1176,65 @@ def PrintFullInfoAboutObject(bucket_listing_ref, incl_acl=True):
       else:
         marker_props[add_prop.key] = add_prop.value
     if non_marker_props:
-      print '\tMetadata:'
+      print MakeMetadataLine('Metadata', '')
       for ap in non_marker_props:
-        meta_string = '\t\t%s:\t\t%s' % (ap.key, ap.value)
-        print meta_string.encode(UTF8)
+        print MakeMetadataLine(
+            ('%s' % ap.key).encode(UTF8), ('%s' % ap.value).encode(UTF8),
+            indent=2)
   if obj.customerEncryption:
-    if not obj.crc32c: print '\tHash (crc32c):\t\tencrypted'
-    if not obj.md5Hash: print '\tHash (md5):\t\tencrypted'
-    print ('\tEncryption algorithm:\t%s' %
-           obj.customerEncryption.encryptionAlgorithm)
-    print '\tEncryption key SHA256:\t%s' % obj.customerEncryption.keySha256
-  if obj.crc32c: print '\tHash (crc32c):\t\t%s' % obj.crc32c
-  if obj.md5Hash: print '\tHash (md5):\t\t%s' % obj.md5Hash
-  print '\tETag:\t\t\t%s' % obj.etag.strip('"\'')
+    if not obj.crc32c:
+      print MakeMetadataLine('Hash (crc32c)', 'encrypted')
+    if not obj.md5Hash:
+      print MakeMetadataLine('Hash (md5)', 'encrypted')
+    print MakeMetadataLine(
+        'Encryption algorithm', obj.customerEncryption.encryptionAlgorithm)
+    print MakeMetadataLine(
+        'Encryption key SHA256', obj.customerEncryption.keySha256)
+  if obj.crc32c:
+    print MakeMetadataLine('Hash (crc32c)', obj.crc32c)
+  if obj.md5Hash:
+    print MakeMetadataLine('Hash (md5)', obj.md5Hash)
+  print MakeMetadataLine('ETag', obj.etag.strip('"\''))
   if obj.generation:
     generation_str = GenerationFromUrlAndString(storage_url, obj.generation)
-    print '\tGeneration:\t\t%s' % generation_str
+    print MakeMetadataLine('Generation', generation_str)
   if obj.metageneration:
-    print '\tMetageneration:\t\t%s' % obj.metageneration
+    print MakeMetadataLine('Metageneration', obj.metageneration)
   if incl_acl:
     # JSON API won't return acls as part of the response unless we have
     # full control scope
     if obj.acl:
-      print '\tACL:\t\t%s' % AclTranslation.JsonFromMessage(obj.acl)
+      print MakeMetadataLine('ACL', AclTranslation.JsonFromMessage(obj.acl))
     elif S3_ACL_MARKER_GUID in marker_props:
-      print '\tACL:\t\t%s' % marker_props[S3_ACL_MARKER_GUID]
+      print MakeMetadataLine('ACL', marker_props[S3_ACL_MARKER_GUID])
     else:
-      print ('\tACL:\t\t\tACCESS DENIED. Note: you need OWNER '
-             'permission\n\t\t\t\ton the object to read its ACL.')
-
+      print MakeMetadataLine('ACL', 'ACCESS DENIED')
+      print MakeMetadataLine(
+          'Note', 'You need OWNER permission on the object to read its ACL', 2)
   return (num_objs, num_bytes)
+
+
+def MakeMetadataLine(label, value, indent=1):
+  """Returns a string with a vertically aligned label and value.
+
+  Labels of the same indentation level will start at the same column. Values
+  will all start at the same column (unless the combined left-indent and
+  label length is excessively long). If a value spans multiple lines,
+  indentation will only be applied to the first line. Example output from
+  several calls:
+
+      Label1:            Value (default indent of 1 was used)
+          Sublabel1:     Value (used indent of 2 here)
+      Label2:            Value
+
+  Args:
+    label: The label to print in the first column.
+    value: The value to print in the second column.
+    indent: (4 * indent) spaces will be placed before the label.
+  Returns:
+    A string with a vertically aligned label and value.
+  """
+  return '%s%s' % (((' ' * indent * 4) + label + ':').ljust(28), value)
 
 
 def CompareVersions(first, second):
@@ -1043,7 +1458,7 @@ def CheckMultiprocessingAvailableAndInit(logger=None):
   if IS_WINDOWS:
     message = """
 Multiple processes are not supported on Windows. Operations requesting
-parallelism will be executed with multiple threads in a single process only.    
+parallelism will be executed with multiple threads in a single process only.
 """
     if logger:
       logger.warn(message)
@@ -1225,6 +1640,55 @@ def FixWindowsEncodingIfNeeded(input_str):
     return input_str
 
 
+def LogAndHandleRetries(is_data_transfer=False, status_queue=None):
+  """Higher-order function allowing retry handler to access global status queue.
+
+  Args:
+    is_data_transfer: If True, disable retries in apitools.
+    status_queue: The global status queue.
+
+  Returns:
+    A retry function for retryable errors in apitools.
+  """
+  def WarnAfterManyRetriesHandler(retry_args):
+    """Exception handler for http failures in apitools.
+
+    If the user has had to wait several seconds since their first request, print
+    a progress message to the terminal to let them know we're still retrying,
+    then perform the default retry logic and post a RetryableErrorMessage to the
+    global status queue.
+
+    Args:
+      retry_args: An apitools ExceptionRetryArgs tuple.
+    """
+    if retry_args.total_wait_sec >= LONG_RETRY_WARN_SEC:
+      logging.info('Retrying request, attempt #%d...', retry_args.num_retries)
+    if status_queue:
+      status_queue.put(RetryableErrorMessage(
+          retry_args.exc, time.time(), num_retries=retry_args.num_retries,
+          total_wait_sec=retry_args.total_wait_sec))
+    http_wrapper.HandleExceptionsAndRebuildHttpConnections(retry_args)
+
+  def RetriesInDataTransferHandler(retry_args):
+    """Exception handler that disables retries in apitools data transfers.
+
+    Post a RetryableErrorMessage to the global status queue. We handle the
+    actual retries within the download and upload functions.
+
+    Args:
+      retry_args: An apitools ExceptionRetryArgs tuple.
+    """
+    if status_queue:
+      status_queue.put(RetryableErrorMessage(
+          retry_args.exc, time.time(), num_retries=retry_args.num_retries,
+          total_wait_sec=retry_args.total_wait_sec))
+    http_wrapper.RethrowExceptionHandler(retry_args)
+
+  if is_data_transfer:
+    return RetriesInDataTransferHandler
+  return WarnAfterManyRetriesHandler
+
+
 class GsutilStreamHandler(logging.StreamHandler):
   """A subclass of StreamHandler for use in gsutil."""
 
@@ -1254,3 +1718,51 @@ def ConvertRecursiveToFlatWildcard(url_strs):
   """A generator that adds '**' to each url string in url_strs."""
   for url_str in url_strs:
     yield '%s**' % url_str
+
+
+def NormalizeStorageClass(sc):
+  """Returns a normalized form of the given storage class name.
+
+  Converts the given string to uppercase and expands valid abbreviations to
+  full storage class names (e.g 'std' would return 'STANDARD'). Note that this
+  method does not check if the given storage class is valid.
+
+  Args:
+    sc: String representing the storage class's full name or abbreviation.
+
+  Returns:
+    A string representing the full name of the given storage class.
+  """
+  shorthand_to_full_name = {
+      'CL': 'COLDLINE',
+      'DRA': 'DURABLE_REDUCED_AVAILABILITY',
+      'NL': 'NEARLINE',
+      'S': 'STANDARD',
+      'STD': 'STANDARD'}
+  # Use uppercase; storage class argument for the S3 API must be uppercase,
+  # and it's case-insensitive for GS APIs.
+  sc = sc.upper()
+  if sc in shorthand_to_full_name:
+    sc = shorthand_to_full_name[sc]
+  return sc
+
+
+class RsyncDiffToApply(object):
+  """Class that encapsulates info needed to apply diff for one object."""
+
+  def __init__(self, src_url_str, dst_url_str, src_posix_attrs, diff_action,
+               copy_size):
+    """Constructor.
+
+    Args:
+      src_url_str: The source URL string, or None if diff_action is REMOVE.
+      dst_url_str: The destination URL string.
+      src_posix_attrs: The source posix_attributes.
+      diff_action: _DiffAction to be applied.
+      copy_size: The amount of bytes to copy, or None if diff_action is REMOVE.
+    """
+    self.src_url_str = src_url_str
+    self.dst_url_str = dst_url_str
+    self.src_posix_attrs = src_posix_attrs
+    self.diff_action = diff_action
+    self.copy_size = copy_size

@@ -56,6 +56,7 @@ from gslib.third_party.storage_apitools import storage_v1_messages as apitools_m
 from gslib.util import CheckFreeSpace
 from gslib.util import DivideAndCeil
 from gslib.util import GetCloudApiInstance
+from gslib.util import GetDiskCounters
 from gslib.util import GetFileSize
 from gslib.util import GetMaxRetryDelay
 from gslib.util import HumanReadableToBytes
@@ -609,10 +610,11 @@ class PerfDiagCommand(Command):
 
       if self.threads > 1 or self.processes > 1:
         args = [obj for obj in self.temporary_objects]
-        self.Apply(_DeleteWrapper, args, _PerfdiagExceptionHandler,
-                   arg_checker=DummyArgChecker,
-                   parallel_operations_override=True,
-                   process_count=self.processes, thread_count=self.threads)
+        self.Apply(
+            _DeleteWrapper, args, _PerfdiagExceptionHandler,
+            arg_checker=DummyArgChecker,
+            parallel_operations_override=self.ParallelOverrideReason.PERFDIAG,
+            process_count=self.processes, thread_count=self.threads)
       else:
         for object_name in self.temporary_objects:
           self.Delete(object_name, self.gsutil_api)
@@ -769,10 +771,11 @@ class PerfDiagCommand(Command):
       args.append(FanDownloadTuple(
           need_to_slice, object_names[i], file_name,
           serialization_data[i]))
-    self.Apply(_DownloadObject, args, _PerfdiagExceptionHandler,
-               ('total_requests', 'request_errors'),
-               arg_checker=DummyArgChecker, parallel_operations_override=True,
-               process_count=self.processes, thread_count=self.threads)
+    self.Apply(
+        _DownloadObject, args, _PerfdiagExceptionHandler,
+        ('total_requests', 'request_errors'), arg_checker=DummyArgChecker,
+        parallel_operations_override=self.ParallelOverrideReason.PERFDIAG,
+        process_count=self.processes, thread_count=self.threads)
 
   def PerformSlicedDownload(self, object_name, file_name, serialization_data):
     """Performs a download of an object using the slice strategy.
@@ -793,10 +796,11 @@ class PerfDiagCommand(Command):
       end_byte = min((i + 1) * (component_size) - 1, self.thru_filesize - 1)
       args.append(SliceDownloadTuple(object_name, file_name, serialization_data,
                                      start_byte, end_byte))
-    self.Apply(_DownloadSlice, args, _PerfdiagExceptionHandler,
-               ('total_requests', 'request_errors'),
-               arg_checker=DummyArgChecker, parallel_operations_override=True,
-               process_count=self.processes, thread_count=self.threads)
+    self.Apply(
+        _DownloadSlice, args, _PerfdiagExceptionHandler,
+        ('total_requests', 'request_errors'), arg_checker=DummyArgChecker,
+        parallel_operations_override=self.ParallelOverrideReason.PERFDIAG,
+        process_count=self.processes, thread_count=self.threads)
 
   def PerformFannedUpload(self, need_to_slice, file_names, object_names,
                           use_file):
@@ -818,10 +822,11 @@ class PerfDiagCommand(Command):
     for i in range(len(file_names)):
       args.append(FanUploadTuple(
           need_to_slice, file_names[i], object_names[i], use_file))
-    self.Apply(_UploadObject, args, _PerfdiagExceptionHandler,
-               ('total_requests', 'request_errors'),
-               arg_checker=DummyArgChecker, parallel_operations_override=True,
-               process_count=self.processes, thread_count=self.threads)
+    self.Apply(
+        _UploadObject, args, _PerfdiagExceptionHandler,
+        ('total_requests', 'request_errors'), arg_checker=DummyArgChecker,
+        parallel_operations_override=self.ParallelOverrideReason.PERFDIAG,
+        process_count=self.processes, thread_count=self.threads)
 
   def PerformSlicedUpload(self, file_name, object_name, use_file, gsutil_api):
     """Performs a parallel upload of a file using the slice strategy.
@@ -851,10 +856,11 @@ class PerfDiagCommand(Command):
 
     # Upload the components in parallel.
     try:
-      self.Apply(_UploadSlice, args, _PerfdiagExceptionHandler,
-                 ('total_requests', 'request_errors'),
-                 arg_checker=DummyArgChecker, parallel_operations_override=True,
-                 process_count=self.processes, thread_count=self.threads)
+      self.Apply(
+          _UploadSlice, args, _PerfdiagExceptionHandler,
+          ('total_requests', 'request_errors'), arg_checker=DummyArgChecker,
+          parallel_operations_override=self.ParallelOverrideReason.PERFDIAG,
+          process_count=self.processes, thread_count=self.threads)
 
       # Compose the components into an object.
       request_components = []
@@ -873,11 +879,11 @@ class PerfDiagCommand(Command):
       self._RunOperation(_Compose)
     finally:
       # Delete the temporary components.
-      self.Apply(_DeleteWrapper, component_object_names,
-                 _PerfdiagExceptionHandler,
-                 ('total_requests', 'request_errors'),
-                 arg_checker=DummyArgChecker, parallel_operations_override=True,
-                 process_count=self.processes, thread_count=self.threads)
+      self.Apply(
+          _DeleteWrapper, component_object_names, _PerfdiagExceptionHandler,
+          ('total_requests', 'request_errors'), arg_checker=DummyArgChecker,
+          parallel_operations_override=self.ParallelOverrideReason.PERFDIAG,
+          process_count=self.processes, thread_count=self.threads)
 
   def _RunReadThruTests(self, use_file=False):
     """Runs read throughput tests."""
@@ -1026,14 +1032,17 @@ class PerfDiagCommand(Command):
     self.results['listing'] = {'num_files': self.num_objects}
 
     # Generate N random objects to put into the bucket.
-    list_prefix = 'gsutil-perfdiag-list-'
-    list_fpaths = []
     list_objects = []
     args = []
+    # Differentiate objects created by each perfdiag execution so that leftovers
+    # from a previous run (if perfdiag could not exit gracefully and delete
+    # them) do not affect this run.
+    random_id = ''.join([random.choice(string.lowercase) for _ in range(10)])
+    list_prefix = 'gsutil-perfdiag-list-' + random_id + '-'
+
     for _ in xrange(self.num_objects):
       fpath = self._MakeTempFile(0, mem_data=True, mem_metadata=True,
                                  prefix=list_prefix)
-      list_fpaths.append(fpath)
       object_name = os.path.basename(fpath)
       list_objects.append(object_name)
       args.append(FanUploadTuple(False, fpath, object_name, False))
@@ -1056,20 +1065,25 @@ class PerfDiagCommand(Command):
       """Lists and returns objects in the bucket. Also records latency."""
       t0 = time.time()
       objects = list(self.gsutil_api.ListObjects(
-          self.bucket_url.bucket_name, delimiter='/',
+          self.bucket_url.bucket_name, prefix=list_prefix, delimiter='/',
           provider=self.provider, fields=['items/name']))
+      if len(objects) > self.num_objects:
+        self.logger.warning(
+            'Listing produced more than the expected %d object(s).',
+            self.num_objects)
       t1 = time.time()
       list_latencies.append(t1 - t0)
       return set([obj.data.name for obj in objects])
+
+    def _ListAfterUpload():
+      names = _List()
+      found_objects.update(names & expected_objects)
+      files_seen.append(len(found_objects))
 
     self.logger.info(
         'Listing bucket %s waiting for %s objects to appear...',
         self.bucket_url.bucket_name, self.num_objects)
     while expected_objects - found_objects:
-      def _ListAfterUpload():
-        names = _List()
-        found_objects.update(names & expected_objects)
-        files_seen.append(len(found_objects))
       self._RunOperation(_ListAfterUpload)
       if expected_objects - found_objects:
         if time.time() - total_start_time > self.MAX_LISTING_WAIT_TIME:
@@ -1959,7 +1973,7 @@ class PerfDiagCommand(Command):
       if netstat_output:
         self.results['sysinfo']['netstat_start'] = netstat_output
       if IS_LINUX:
-        self.results['sysinfo']['disk_counters_start'] = self._GetDiskCounters()
+        self.results['sysinfo']['disk_counters_start'] = GetDiskCounters()
       # Record bucket URL.
       self.results['bucket_uri'] = str(self.bucket_url)
       self.results['json_format'] = 'perfdiag'
@@ -1985,7 +1999,7 @@ class PerfDiagCommand(Command):
       if netstat_output:
         self.results['sysinfo']['netstat_end'] = netstat_output
       if IS_LINUX:
-        self.results['sysinfo']['disk_counters_end'] = self._GetDiskCounters()
+        self.results['sysinfo']['disk_counters_end'] = GetDiskCounters()
 
       self.results['total_requests'] = self.total_requests
       self.results['request_errors'] = self.request_errors

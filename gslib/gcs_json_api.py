@@ -20,26 +20,18 @@ from contextlib import contextmanager
 import httplib
 import json
 import logging
-import os
 import socket
 import ssl
 import time
 import traceback
 
-from apitools.base.py import credentials_lib
 from apitools.base.py import encoding
 from apitools.base.py import exceptions as apitools_exceptions
 from apitools.base.py import http_wrapper as apitools_http_wrapper
 from apitools.base.py import transfer as apitools_transfer
 from apitools.base.py.util import CalculateWaitForRetry
 
-import boto
 from boto import config
-from gcs_oauth2_boto_plugin import oauth2_helper
-import httplib2
-import oauth2client
-from oauth2client import devshell
-from oauth2client import multistore_file
 
 from gslib.cloud_api import AccessDeniedException
 from gslib.cloud_api import ArgumentException
@@ -58,10 +50,10 @@ from gslib.cloud_api import ResumableUploadStartOverException
 from gslib.cloud_api import ServiceException
 from gslib.cloud_api_helper import ListToGetFields
 from gslib.cloud_api_helper import ValidateDstObjectMetadata
-from gslib.cred_types import CredTypes
 from gslib.encryption_helper import Base64Sha256FromBase64EncryptionKey
 from gslib.encryption_helper import FindMatchingCryptoKey
-from gslib.exception import CommandException
+from gslib.gcs_json_credentials import CheckAndGetCredentials
+from gslib.gcs_json_credentials import GetCredentialStoreKeyDict
 from gslib.gcs_json_media import BytesTransferredContainer
 from gslib.gcs_json_media import DownloadCallbackConnectionClassFactory
 from gslib.gcs_json_media import HttpWithDownloadStream
@@ -70,7 +62,7 @@ from gslib.gcs_json_media import UploadCallbackConnectionClassFactory
 from gslib.gcs_json_media import WrapDownloadHttpRequest
 from gslib.gcs_json_media import WrapUploadHttpRequest
 from gslib.no_op_credentials import NoOpCredentials
-from gslib.progress_callback import ProgressCallbackWithBackoff
+from gslib.progress_callback import ProgressCallbackWithTimeout
 from gslib.project_id import PopulateProjectId
 from gslib.third_party.storage_apitools import storage_v1_client as apitools_client
 from gslib.third_party.storage_apitools import storage_v1_messages as apitools_messages
@@ -86,16 +78,21 @@ from gslib.translation_helper import DEFAULT_CONTENT_TYPE
 from gslib.translation_helper import PRIVATE_DEFAULT_OBJ_ACL
 from gslib.translation_helper import REMOVE_CORS_CONFIG
 from gslib.util import AddAcceptEncodingGzipIfNeeded
-from gslib.util import GetBotoConfigFileList
 from gslib.util import GetCertsFile
 from gslib.util import GetCredentialStoreFilename
-from gslib.util import GetGceCredentialCacheFilename
 from gslib.util import GetJsonResumableChunkSize
 from gslib.util import GetMaxRetryDelay
 from gslib.util import GetNewHttp
 from gslib.util import GetNumRetries
 from gslib.util import GetPrintableExceptionString
 from gslib.util import JsonResumableChunkSizeDefined
+from gslib.util import LogAndHandleRetries
+from gslib.util import NUM_OBJECTS_PER_LIST_PAGE
+
+
+import httplib2
+import oauth2client
+from oauth2client.contrib import multistore_file
 
 # Implementation supports only 'gs' URLs, so provider is unused.
 # pylint: disable=unused-argument
@@ -103,7 +100,6 @@ from gslib.util import JsonResumableChunkSizeDefined
 DEFAULT_GCS_JSON_VERSION = 'v1'
 
 NUM_BUCKETS_PER_LIST_PAGE = 1000
-NUM_OBJECTS_PER_LIST_PAGE = 1000
 
 TRANSLATABLE_APITOOLS_EXCEPTIONS = (apitools_exceptions.HttpError,
                                     apitools_exceptions.StreamExhausted,
@@ -145,17 +141,22 @@ _ENCRYPTED_HASHES_SET = set(['crc32c', 'md5Hash'])
 _SKIP_LISTING_OBJECT = 'skip'
 
 
+_INSUFFICIENT_OAUTH2_SCOPE_MESSAGE = (
+    'Insufficient OAuth2 scope to perform this operation.')
+
+
 class GcsJsonApi(CloudApi):
   """Google Cloud Storage JSON implementation of gsutil Cloud API."""
 
-  def __init__(self, bucket_storage_uri_class, logger, provider=None,
-               credentials=None, debug=0, trace_token=None,
+  def __init__(self, bucket_storage_uri_class, logger, status_queue,
+               provider=None, credentials=None, debug=0, trace_token=None,
                perf_trace_token=None):
     """Performs necessary setup for interacting with Google Cloud Storage.
 
     Args:
       bucket_storage_uri_class: Unused.
       logger: logging.logger for outputting log messages.
+      status_queue: Queue for relaying status to UI.
       provider: Unused.  This implementation supports only Google Cloud Storage.
       credentials: Credentials to be used for interacting with Google Cloud
                    Storage.
@@ -165,13 +166,12 @@ class GcsJsonApi(CloudApi):
     """
     # TODO: Plumb host_header for perfdiag / test_perfdiag.
     # TODO: Add jitter to apitools' http_wrapper retry mechanism.
-    super(GcsJsonApi, self).__init__(bucket_storage_uri_class, logger,
-                                     provider='gs', debug=debug,
-                                     trace_token=trace_token,
-                                     perf_trace_token=perf_trace_token)
+    super(GcsJsonApi, self).__init__(
+        bucket_storage_uri_class, logger, status_queue, provider='gs',
+        debug=debug, trace_token=trace_token, perf_trace_token=perf_trace_token)
     no_op_credentials = False
     if not credentials:
-      loaded_credentials = self._CheckAndGetCredentials()
+      loaded_credentials = CheckAndGetCredentials(logger)
 
       if not loaded_credentials:
         loaded_credentials = NoOpCredentials()
@@ -233,8 +233,8 @@ class GcsJsonApi(CloudApi):
     self.url_base = (self.http_base + self.host_base + self.host_port + '/' +
                      'storage/' + self.api_version + '/')
 
-    credential_store_key_dict = self._GetCredentialStoreKeyDict(
-        self.credentials)
+    credential_store_key_dict = GetCredentialStoreKeyDict(self.credentials,
+                                                          self.api_version)
 
     self.credentials.set_store(
         multistore_file.get_credential_storage_custom_key(
@@ -256,8 +256,11 @@ class GcsJsonApi(CloudApi):
         log_response=log_response, credentials=self.credentials,
         version=self.api_version, default_global_params=self.global_params,
         additional_http_headers=additional_http_headers)
+
     self.api_client.max_retry_wait = self.max_retry_wait
     self.api_client.num_retries = self.num_retries
+    self.api_client.retry_func = LogAndHandleRetries(
+        status_queue=self.status_queue)
 
     if no_op_credentials:
       # This API key is not secret and is used to identify gsutil during
@@ -268,132 +271,6 @@ class GcsJsonApi(CloudApi):
   def _AddPerfTraceTokenToHeaders(self, headers):
     if self.perf_trace_token:
       headers['cookie'] = self.perf_trace_token
-
-  def _CheckAndGetCredentials(self):
-    configured_cred_types = []
-    try:
-      if self._HasOauth2UserAccountCreds():
-        configured_cred_types.append(CredTypes.OAUTH2_USER_ACCOUNT)
-      if self._HasOauth2ServiceAccountCreds():
-        configured_cred_types.append(CredTypes.OAUTH2_SERVICE_ACCOUNT)
-      if len(configured_cred_types) > 1:
-        # We only allow one set of configured credentials. Otherwise, we're
-        # choosing one arbitrarily, which can be very confusing to the user
-        # (e.g., if only one is authorized to perform some action) and can
-        # also mask errors.
-        # Because boto merges config files, GCE credentials show up by default
-        # for GCE VMs. We don't want to fail when a user creates a boto file
-        # with their own credentials, so in this case we'll use the OAuth2
-        # user credentials.
-        failed_cred_type = None
-        raise CommandException(
-            ('You have multiple types of configured credentials (%s), which is '
-             'not supported. One common way this happens is if you run gsutil '
-             'config to create credentials and later run gcloud auth, and '
-             'create a second set of credentials. Your boto config path is: '
-             '%s. For more help, see "gsutil help creds".')
-            % (configured_cred_types, GetBotoConfigFileList()))
-
-      failed_cred_type = CredTypes.OAUTH2_USER_ACCOUNT
-      user_creds = self._GetOauth2UserAccountCreds()
-      failed_cred_type = CredTypes.OAUTH2_SERVICE_ACCOUNT
-      service_account_creds = self._GetOauth2ServiceAccountCreds()
-      failed_cred_type = CredTypes.GCE
-      gce_creds = self._GetGceCreds()
-      failed_cred_type = CredTypes.DEVSHELL
-      devshell_creds = self._GetDevshellCreds()
-      return user_creds or service_account_creds or gce_creds or devshell_creds
-    except:  # pylint: disable=bare-except
-      # If we didn't actually try to authenticate because there were multiple
-      # types of configured credentials, don't emit this warning.
-      if failed_cred_type:
-        if self.logger.isEnabledFor(logging.DEBUG):
-          self.logger.debug(traceback.format_exc())
-        if os.environ.get('CLOUDSDK_WRAPPER') == '1':
-          self.logger.warn(
-              'Your "%s" credentials are invalid. Please run\n'
-              '  $ gcloud auth login', failed_cred_type)
-        else:
-          self.logger.warn(
-              'Your "%s" credentials are invalid. For more help, see '
-              '"gsutil help creds", or re-run the gsutil config command (see '
-              '"gsutil help config").', failed_cred_type)
-
-      # If there's any set of configured credentials, we'll fail if they're
-      # invalid, rather than silently falling back to anonymous config (as
-      # boto does). That approach leads to much confusion if users don't
-      # realize their credentials are invalid.
-      raise
-
-  def _HasOauth2ServiceAccountCreds(self):
-    return config.has_option('Credentials', 'gs_service_key_file')
-
-  def _HasOauth2UserAccountCreds(self):
-    return config.has_option('Credentials', 'gs_oauth2_refresh_token')
-
-  def _HasGceCreds(self):
-    return config.has_option('GoogleCompute', 'service_account')
-
-  def _GetOauth2ServiceAccountCreds(self):
-    if self._HasOauth2ServiceAccountCreds():
-      return oauth2_helper.OAuth2ClientFromBotoConfig(
-          boto.config,
-          cred_type=CredTypes.OAUTH2_SERVICE_ACCOUNT).GetCredentials()
-
-  def _GetOauth2UserAccountCreds(self):
-    if self._HasOauth2UserAccountCreds():
-      return oauth2_helper.OAuth2ClientFromBotoConfig(
-          boto.config).GetCredentials()
-
-  def _GetGceCreds(self):
-    if self._HasGceCreds():
-      try:
-        return credentials_lib.GceAssertionCredentials(
-            cache_filename=GetGceCredentialCacheFilename())
-      except apitools_exceptions.ResourceUnavailableError, e:
-        if 'service account' in str(e) and 'does not exist' in str(e):
-          return None
-        raise
-
-  def _GetDevshellCreds(self):
-    try:
-      return devshell.DevshellCredentials()
-    except devshell.NoDevshellServer:
-      return None
-    except:
-      raise
-
-  def _GetCredentialStoreKeyDict(self, credentials):
-    """Disambiguates a credential for caching in a credential store.
-
-    Different credential types have different fields that identify them.
-    This function assembles relevant information in a dict and returns it.
-
-    Args:
-      credentials: An OAuth2Credentials object.
-
-    Returns:
-      Dict of relevant identifiers for credentials.
-    """
-    # TODO: If scopes ever become available in the credentials themselves,
-    # include them in the key dict.
-    key_dict = {'api_version': self.api_version}
-    # pylint: disable=protected-access
-    if isinstance(credentials, devshell.DevshellCredentials):
-      key_dict['user_email'] = credentials.user_email
-    elif isinstance(credentials,
-                    oauth2client.service_account._ServiceAccountCredentials):
-      key_dict['_service_account_email'] = credentials._service_account_email
-    elif isinstance(credentials,
-                    oauth2client.client.SignedJwtAssertionCredentials):
-      key_dict['service_account_name'] = credentials.service_account_name
-    elif isinstance(credentials, oauth2client.client.OAuth2Credentials):
-      if credentials.client_id and credentials.client_id != 'null':
-        key_dict['client_id'] = credentials.client_id
-      key_dict['refresh_token'] = credentials.refresh_token
-    # pylint: enable=protected-access
-
-    return key_dict
 
   def _GetNewDownloadHttp(self):
     return GetNewHttp(http_class=HttpWithDownloadStream)
@@ -422,6 +299,65 @@ class GcsJsonApi(CloudApi):
       raise ArgumentException(
           'gsutil client error: customerEncryption must be included when '
           'requesting potentially encrypted fields %s' % _ENCRYPTED_HASHES_SET)
+
+  def GetBucketIamPolicy(self, bucket_name, provider=None, fields=None):
+    apitools_request = apitools_messages.StorageBucketsGetIamPolicyRequest(
+        bucket=bucket_name)
+    global_params = apitools_messages.StandardQueryParameters()
+    if fields:
+      global_params.fields = ','.join(set(fields))
+    try:
+      return self.api_client.buckets.GetIamPolicy(
+          apitools_request,
+          global_params=global_params)
+    except TRANSLATABLE_APITOOLS_EXCEPTIONS as e:
+      self._TranslateExceptionAndRaise(e, bucket_name=bucket_name)
+
+  def GetObjectIamPolicy(self, bucket_name, object_name,
+                         generation, provider=None, fields=None):
+    if generation is not None:
+      generation = long(generation)
+    apitools_request = apitools_messages.StorageObjectsGetIamPolicyRequest(
+        bucket=bucket_name, object=object_name, generation=generation)
+    global_params = apitools_messages.StandardQueryParameters()
+    if fields:
+      global_params.fields = ','.join(set(fields))
+    try:
+      return self.api_client.objects.GetIamPolicy(
+          apitools_request,
+          global_params=global_params)
+    except TRANSLATABLE_APITOOLS_EXCEPTIONS as e:
+      self._TranslateExceptionAndRaise(
+          e, bucket_name=bucket_name, object_name=object_name,
+          generation=generation)
+
+  def SetObjectIamPolicy(self, bucket_name, object_name, policy,
+                         generation=None, provider=None):
+    if generation is not None:
+      generation = long(generation)
+    api_request = apitools_messages.StorageObjectsSetIamPolicyRequest(
+        bucket=bucket_name, object=object_name, generation=generation,
+        policy=policy)
+    global_params = apitools_messages.StandardQueryParameters()
+    try:
+      return self.api_client.objects.SetIamPolicy(
+          api_request,
+          global_params=global_params)
+    except TRANSLATABLE_APITOOLS_EXCEPTIONS as e:
+      self._TranslateExceptionAndRaise(
+          e, bucket_name=bucket_name, object_name=object_name)
+
+  def SetBucketIamPolicy(self, bucket_name, policy, provider=None):
+    apitools_request = apitools_messages.StorageBucketsSetIamPolicyRequest(
+        bucket=bucket_name,
+        policy=policy)
+    global_params = apitools_messages.StandardQueryParameters()
+    try:
+      return self.api_client.buckets.SetIamPolicy(
+          apitools_request,
+          global_params=global_params)
+    except TRANSLATABLE_APITOOLS_EXCEPTIONS as e:
+      self._TranslateExceptionAndRaise(e, bucket_name=bucket_name)
 
   def GetBucket(self, bucket_name, provider=None, fields=None):
     """See CloudApi class for function doc strings."""
@@ -939,10 +875,11 @@ class GcsJsonApi(CloudApi):
         bucket=bucket_name, object=object_name, generation=generation)
 
     # Disable retries in apitools. We will handle them explicitly for
-    # resumable downloads; one-shot downloads are not retriable as we do
+    # resumable downloads; one-shot downloads are not retryable as we do
     # not track how many bytes were written to the stream.
-    apitools_download.retry_func = (
-        apitools_http_wrapper.RethrowExceptionHandler)
+    apitools_download.retry_func = LogAndHandleRetries(
+        is_data_transfer=True,
+        status_queue=self.status_queue)
 
     try:
       if download_strategy == CloudApi.DownloadStrategy.RESUMABLE:
@@ -1023,7 +960,7 @@ class GcsJsonApi(CloudApi):
 
     # TODO: If we have a resumable download with accept-encoding:gzip
     # on a object that is compressible but not in gzip form in the cloud,
-    # on-the-fly compression will gzip the object.  In this case if our
+    # on-the-fly compression may gzip the object.  In this case if our
     # download breaks, future requests will ignore the range header and just
     # return the object (gzipped) in its entirety.  Ideally, we would unzip
     # the bytes that we have locally and send a range request without
@@ -1034,7 +971,6 @@ class GcsJsonApi(CloudApi):
     # user-agent header from api_client's http automatically.
     additional_headers = {
         'user-agent': self.api_client.user_agent,
-        'accept-encoding': 'gzip'
     }
     AddAcceptEncodingGzipIfNeeded(additional_headers,
                                   compressed_encoding=compressed_encoding)
@@ -1231,8 +1167,9 @@ class GcsJsonApi(CloudApi):
               upload=apitools_upload,
               global_params=global_params)
       # Disable retries in apitools. We will handle them explicitly here.
-      apitools_upload.retry_func = (
-          apitools_http_wrapper.RethrowExceptionHandler)
+      apitools_upload.retry_func = LogAndHandleRetries(
+          is_data_transfer=True,
+          status_queue=self.status_queue)
 
       # Disable apitools' default print callbacks.
       def _NoOpCallback(unused_response, unused_upload_object):
@@ -1418,7 +1355,7 @@ class GcsJsonApi(CloudApi):
     crypto_headers = self._RewriteCryptoHeadersFromTuples(
         decryption_tuple=decryption_tuple, encryption_tuple=encryption_tuple)
 
-    progress_cb_with_backoff = None
+    progress_cb_with_timeout = None
     try:
       last_bytes_written = 0L
       while True:
@@ -1438,11 +1375,11 @@ class GcsJsonApi(CloudApi):
           rewrite_response = self.api_client.objects.Rewrite(
               apitools_request, global_params=global_params)
         bytes_written = long(rewrite_response.totalBytesRewritten)
-        if progress_callback and not progress_cb_with_backoff:
-          progress_cb_with_backoff = ProgressCallbackWithBackoff(
+        if progress_callback and not progress_cb_with_timeout:
+          progress_cb_with_timeout = ProgressCallbackWithTimeout(
               long(rewrite_response.objectSize), progress_callback)
-        if progress_cb_with_backoff:
-          progress_cb_with_backoff.Progress(
+        if progress_cb_with_timeout:
+          progress_cb_with_timeout.Progress(
               bytes_written - last_bytes_written)
 
         if rewrite_response.done:
@@ -1650,6 +1587,25 @@ class GcsJsonApi(CloudApi):
           # If we couldn't decode anything, just leave the message as None.
           pass
 
+  def _GetAcceptableScopesFromHttpError(self, http_error):
+    try:
+      www_authenticate = http_error.response['www-authenticate']
+      # In the event of a scope error, the www-authenticate field of the HTTP
+      # response should contain text of the form
+      #
+      # 'Bearer realm="https://accounts.google.com/", error=insufficient_scope,
+      # scope="${space separated list of acceptable scopes}"'
+      #
+      # Here we use a quick string search to find the scope list, just looking
+      # for a substring with the form 'scope="${scopes}"'.
+      scope_idx = www_authenticate.find('scope="')
+      if scope_idx >= 0:
+        scopes = www_authenticate[scope_idx:].split('"')[1]
+        return 'Acceptable scopes: %s' % scopes
+    except Exception:  # pylint: disable=broad-except
+      # Return None if we have any trouble parsing out the acceptable scopes.
+      pass
+
   def _TranslateApitoolsResumableUploadException(self, e):
     if isinstance(e, apitools_exceptions.HttpError):
       message = self._GetMessageFromHttpError(e)
@@ -1704,6 +1660,12 @@ class GcsJsonApi(CloudApi):
           return AccessDeniedException(
               message or 'Access denied: login required.',
               status=e.status_code)
+        elif 'insufficient_scope' in str(e):
+          # If the service includes insufficient scope error detail in the
+          # response body, this check can be removed.
+          return AccessDeniedException(
+              _INSUFFICIENT_OAUTH2_SCOPE_MESSAGE, status=e.status_code,
+              body=self._GetAcceptableScopesFromHttpError(e))
       elif e.status_code == 403:
         if 'The account for the specified project has been disabled' in str(e):
           return AccessDeniedException(message or 'Account disabled.',
@@ -1733,6 +1695,12 @@ class GcsJsonApi(CloudApi):
               'project, select APIs and Auth and enable the '
               'Google Cloud Storage JSON API.',
               status=e.status_code)
+        elif 'insufficient_scope' in str(e):
+          # If the service includes insufficient scope error detail in the
+          # response body, this check can be removed.
+          return AccessDeniedException(
+              _INSUFFICIENT_OAUTH2_SCOPE_MESSAGE, status=e.status_code,
+              body=self._GetAcceptableScopesFromHttpError(e))
         else:
           return AccessDeniedException(message or e.message,
                                        status=e.status_code)
