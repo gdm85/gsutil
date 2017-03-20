@@ -18,6 +18,7 @@ from __future__ import absolute_import
 
 import sys
 
+from gslib import metrics
 from gslib.command import Command
 from gslib.command_argument import CommandArgument
 from gslib.cs_api_map import ApiSelector
@@ -105,7 +106,12 @@ class LifecycleCommand(Command):
       file_url_ok=True,
       provider_url_ok=False,
       urls_start_arg=1,
-      gs_api_support=[ApiSelector.XML, ApiSelector.JSON],
+      gs_api_support=[
+          ApiSelector.JSON,
+          # TODO: Remove preference for JSON with gs buckets once Boto is
+          # updated to support new gs lifecycle fields.
+          # ApiSelector.XML
+      ],
       gs_default_api=ApiSelector.JSON,
       argparse_arguments={
           'set': [
@@ -184,8 +190,10 @@ class LifecycleCommand(Command):
     """Command entry point for the lifecycle command."""
     subcommand = self.args.pop(0)
     if subcommand == 'get':
+      metrics.LogCommandParams(subcommands=[subcommand])
       return self._GetLifecycleConfig()
     elif subcommand == 'set':
+      metrics.LogCommandParams(subcommands=[subcommand])
       return self._SetLifecycleConfig()
     else:
       raise CommandException('Invalid subcommand "%s" for the %s command.' %

@@ -165,7 +165,7 @@ def ObjectMetadataFromHeaders(headers):
                 key=header_key, value=value))
       else:
         raise ArgumentException(
-            'Invalid header specifed: %s:%s' % (header, value))
+            'Invalid header specified: %s:%s' % (header, value))
   return obj_metadata
 
 
@@ -174,7 +174,7 @@ def HeadersFromObjectMetadata(dst_obj_metadata, provider):
 
   Args:
     dst_obj_metadata: Object metadata to create the headers from.
-    provider: Provider string ('gs' or 's3')
+    provider: Provider string ('gs' or 's3').
 
   Returns:
     Headers dictionary.
@@ -214,6 +214,15 @@ def HeadersFromObjectMetadata(dst_obj_metadata, provider):
       headers['content-type'] = None
     else:
       headers['content-type'] = dst_obj_metadata.contentType.strip()
+  if dst_obj_metadata.storageClass:
+    header_name = 'storage-class'
+    if provider == 'gs':
+      header_name = 'x-goog-' + header_name
+    elif provider == 's3':
+      header_name = 'x-amz-' + header_name
+    else:
+      raise ArgumentException('Invalid provider specified: %s' % provider)
+    headers[header_name] = dst_obj_metadata.storageClass.strip()
   if (dst_obj_metadata.metadata and
       dst_obj_metadata.metadata.additionalProperties):
     for additional_property in dst_obj_metadata.metadata.additionalProperties:
@@ -246,8 +255,8 @@ def CopyObjectMetadata(src_obj_metadata, dst_obj_metadata, override=False):
   """Copies metadata from src_obj_metadata to dst_obj_metadata.
 
   Args:
-    src_obj_metadata: Metadata from source object
-    dst_obj_metadata: Initialized metadata for destination object
+    src_obj_metadata: Metadata from source object.
+    dst_obj_metadata: Initialized metadata for destination object.
     override: If true, will overwrite metadata in destination object.
               If false, only writes metadata for values that don't already
               exist.
@@ -264,7 +273,19 @@ def CopyObjectMetadata(src_obj_metadata, dst_obj_metadata, override=False):
     dst_obj_metadata.contentType = src_obj_metadata.contentType
   if override or not dst_obj_metadata.md5Hash:
     dst_obj_metadata.md5Hash = src_obj_metadata.md5Hash
+  CopyCustomMetadata(src_obj_metadata, dst_obj_metadata, override=override)
 
+
+def CopyCustomMetadata(src_obj_metadata, dst_obj_metadata, override=False):
+  """Copies custom metadata from src_obj_metadata to dst_obj_metadata.
+
+  Args:
+    src_obj_metadata: Metadata from source object.
+    dst_obj_metadata: Initialized metadata for destination object.
+    override: If true, will overwrite metadata in destination object.
+              If false, only writes metadata for values that don't already
+              exist.
+  """
   # TODO: Apitools should ideally treat metadata like a real dictionary instead
   # of a list of key/value pairs (with an O(N^2) lookup).  In practice the
   # number of values is typically small enough not to matter.
@@ -286,7 +307,8 @@ def CopyObjectMetadata(src_obj_metadata, dst_obj_metadata, override=False):
             dst_metadata_dict[src_prop.key] = None
           else:
             dst_metadata_dict[src_prop.key] = src_prop.value
-      else:
+      elif src_prop.value != '':  # pylint: disable=g-explicit-bool-comparison
+        # Don't propagate '' value since that means to remove the header.
         dst_metadata_dict[src_prop.key] = src_prop.value
     # Rewrite the list with our updated dict.
     dst_obj_metadata.metadata.additionalProperties = []

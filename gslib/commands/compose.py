@@ -29,9 +29,10 @@ from gslib.translation_helper import PreconditionsFromHeaders
 
 MAX_COMPONENT_COUNT = 1024
 MAX_COMPOSE_ARITY = 32
+MAX_COMPONENT_RATE = 200
 
 _SYNOPSIS = """
-  gsutil compose gs://bucket/obj1 gs://bucket/obj2 ... gs://bucket/composite
+  gsutil compose gs://bucket/obj1 [gs://bucket/obj2 ...] gs://bucket/composite
 """
 
 _DETAILED_HELP_TEXT = ("""
@@ -67,10 +68,15 @@ _DETAILED_HELP_TEXT = ("""
   Note that there is a limit (currently %d) to the number of components that can
   be composed in a single operation.
 
-  In addition, there is a limit (currently %d) to the total number of components
+  There is a limit (currently %d) to the total number of components
   for a given composite object. This means you can append to each object at most
   %d times.
-""" % (MAX_COMPOSE_ARITY, MAX_COMPONENT_COUNT, MAX_COMPONENT_COUNT - 1))
+  
+  There is a per-project rate limit (currently %d) to the number of components
+  you can compose per second. This rate counts both the components being
+  appended to a composite object as well as the components being copied when
+  the composite object of which they are a part is copied.
+""" % (MAX_COMPOSE_ARITY, MAX_COMPONENT_COUNT, MAX_COMPONENT_COUNT - 1, MAX_COMPONENT_RATE))
 
 
 class ComposeCommand(Command):
@@ -81,7 +87,7 @@ class ComposeCommand(Command):
       'compose',
       command_name_aliases=['concat'],
       usage_synopsis=_SYNOPSIS,
-      min_args=2,
+      min_args=1,
       max_args=MAX_COMPOSE_ARITY + 1,
       supported_sub_args='',
       # Not files, just object names without gs:// prefix.
@@ -155,8 +161,8 @@ class ComposeCommand(Command):
           raise CommandException('"compose" called with too many component '
                                  'objects. Limit is %d.' % MAX_COMPOSE_ARITY)
 
-    if len(components) < 2:
-      raise CommandException('"compose" requires at least 2 component objects.')
+    if not components:
+      raise CommandException('"compose" requires at least 1 component object.')
 
     dst_obj_metadata.contentType = self.gsutil_api.GetObjectMetadata(
         first_src_url.bucket_name, first_src_url.object_name,
@@ -165,7 +171,8 @@ class ComposeCommand(Command):
     preconditions = PreconditionsFromHeaders(self.headers or {})
 
     self.logger.info(
-        'Composing %s from %d component objects.', target_url, len(components))
+        'Composing %s from %d component object(s).',
+        target_url, len(components))
     self.gsutil_api.ComposeObject(
         components, dst_obj_metadata, preconditions=preconditions,
         provider=target_url.scheme, encryption_tuple=GetEncryptionTuple())

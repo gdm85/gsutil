@@ -17,16 +17,19 @@
 
 from __future__ import absolute_import
 
+import logging
 import os
 import time
 import traceback
 
+from apitools.base.py import encoding
 from gslib import copy_helper
 from gslib.cat_helper import CatHelper
 from gslib.command import Command
 from gslib.command_argument import CommandArgument
 from gslib.commands.compose import MAX_COMPONENT_COUNT
 from gslib.copy_helper import CreateCopyHelperOpts
+from gslib.copy_helper import GetSourceFieldsNeededForCopy
 from gslib.copy_helper import GZIP_ALL_FILES
 from gslib.copy_helper import ItemExistsError
 from gslib.copy_helper import Manifest
@@ -34,14 +37,26 @@ from gslib.copy_helper import PARALLEL_UPLOAD_TEMP_NAMESPACE
 from gslib.copy_helper import SkipUnsupportedObjectError
 from gslib.cs_api_map import ApiSelector
 from gslib.exception import CommandException
+from gslib.metrics import LogPerformanceSummaryParams
 from gslib.name_expansion import NameExpansionIterator
+from gslib.name_expansion import SeekAheadNameExpansionIterator
+from gslib.name_expansion import SourceUrlTypeIterator
+from gslib.posix_util import ConvertModeToBase8
+from gslib.posix_util import DeserializeFileAttributesFromObjectMetadata
+from gslib.posix_util import InitializeUserGroups
+from gslib.posix_util import POSIXAttributes
+from gslib.posix_util import SerializeFileAttributesToObjectMetadata
+from gslib.posix_util import ValidateFilePermissionAccess
 from gslib.storage_url import ContainsWildcard
+from gslib.third_party.storage_apitools import storage_v1_messages as apitools_messages
+from gslib.util import CalculateThroughput
 from gslib.util import CreateLock
 from gslib.util import DEBUGLEVEL_DUMP_REQUESTS
 from gslib.util import GetCloudApiInstance
 from gslib.util import IsCloudSubdirPlaceholder
 from gslib.util import MakeHumanReadable
 from gslib.util import NO_MAX
+from gslib.util import NormalizeStorageClass
 from gslib.util import RemoveCRLFFromString
 from gslib.util import StdinIterator
 
@@ -111,7 +126,7 @@ _NAME_CONSTRUCTION_TEXT = """
   will create the object gs://my-bucket/dir2/a/b/c.
 
   In contrast, copying individually named files will result in objects named by
-  the final path component of the source files. For example, again assuming 
+  the final path component of the source files. For example, again assuming
   dir1/dir2 contains a/b/c, the command:
 
     gsutil cp dir1/dir2/** gs://my-bucket
@@ -203,7 +218,7 @@ _COPY_IN_CLOUD_TEXT = """
   in the cloud, which may take some time (but still will be faster than
   downloading and re-uploading). Such operations can be resumed with the same
   command if they are interrupted, so long as the command parameters are
-  identical. 
+  identical.
 
   Note that by default, the gsutil cp command does not copy the object
   ACL to the new object, and instead will use the default bucket ACL (see
@@ -382,26 +397,32 @@ _PARALLEL_COMPOSITE_UPLOADS_TEXT = """
   gsutil can automatically use
   `object composition <https://cloud.google.com/storage/docs/composite-objects>`_
   to perform uploads in parallel for large, local files being uploaded to Google
-  Cloud Storage. If enabled (see next paragraph), a large file will be split
-  into component pieces that are uploaded in parallel and then composed in the
-  cloud (and the temporary components finally deleted). No additional local disk
-  space is required for this operation.
+  Cloud Storage. If enabled (see below), a large file will be split into
+  component pieces that are uploaded in parallel and then composed in the cloud
+  (and the temporary components finally deleted). A file can be broken into as
+  many as 32 component pieces; until this piece limit is reached, the maximum
+  size of each component piece is determined by the variable
+  "parallel_composite_upload_component_size," specified in the [GSUtil] section
+  of your .boto configuration file (for files that are otherwise too big,
+  components are as large as needed to fit into 32 pieces). No additional local
+  disk space is required for this operation.
 
   Using parallel composite uploads presents a tradeoff between upload
   performance and download configuration: If you enable parallel composite
   uploads your uploads will run faster, but someone will need to install a
   compiled crcmod (see "gsutil help crcmod") on every machine where objects are
-  downloaded by gsutil or other Python applications. For some distributions this
-  is easy (e.g., it comes pre-installed on MacOS), but in other cases some users
-  have found it difficult. Because of this, at present parallel composite
-  uploads are disabled by default. Google is actively working with a number of
-  the Linux distributions to get crcmod included with the stock distribution.
-  Once that is done we will re-enable parallel composite uploads by default in
-  gsutil.
+  downloaded by gsutil or other Python applications. Note that for such uploads,
+  crcmod is required for downloading regardless of whether the parallel
+  composite upload option is on or not. For some distributions this is easy
+  (e.g., it comes pre-installed on MacOS), but in other cases some users have
+  found it difficult. Because of this, at present parallel composite uploads are
+  disabled by default. Google is actively working with a number of the Linux
+  distributions to get crcmod included with the stock distribution. Once that is
+  done we will re-enable parallel composite uploads by default in gsutil.
 
-  Parallel composite uploads should not be used with NEARLINE storage
-  class buckets, because doing this would incur an early deletion charge for
-  each component object.
+  Warning: Parallel composite uploads should not be used with NEARLINE or
+  COLDLINE storage class buckets, because doing so incurs an early deletion
+  charge for each component object.
 
   To try parallel composite uploads you can run the command:
 
@@ -616,10 +637,22 @@ _OPTIONS_TEXT = """
                  You can avoid the additional performance and cost of using
                  cp -p if you want all objects in the destination bucket to end
                  up with the same ACL by setting a default object ACL on that
-                 bucket instead of using cp -p. See "help gsutil defacl".
+                 bucket instead of using cp -p. See "gsutil help defacl".
 
                  Note that it's not valid to specify both the -a and -p options
                  together.
+
+  -P             Causes POSIX attributes to be preserved when objects are
+                 copied. With this feature enabled, gsutil cp will copy fields
+                 provided by stat. These are the user ID of the owner, the group
+                 ID of the owning group, the mode (permissions) of the file, and
+                 the access/modification time of the file. For downloads, these
+                 attributes will only be set if the source objects were uploaded
+                 with this flag enabled.
+
+                 On Windows, this flag will only set and restore access time and
+                 modification time. This is because Windows doesn't have a
+                 notion of POSIX uid/gid/mode.
 
   -R, -r         The -R and -r options are synonymous. Causes directories,
                  buckets, and bucket subdirectories to be copied recursively.
@@ -628,6 +661,10 @@ _OPTIONS_TEXT = """
                  neglecting to specify this option for a download will cause
                  gsutil to copy any objects at the current bucket directory
                  level, and skip any subdirectories.
+
+  -s <class>     The storage class of the destination object(s). If not
+                 specified, the default storage class of the destination bucket
+                 is used. Not valid for copying to non-cloud destinations.
 
   -U             Skip objects with unsupported object types instead of failing.
                  Unsupported object types are Amazon S3 Objects in the GLACIER
@@ -700,11 +737,12 @@ _DETAILED_HELP_TEXT = '\n\n'.join([_SYNOPSIS_TEXT,
                                    _OPTIONS_TEXT])
 
 
-CP_SUB_ARGS = 'a:AcDeIL:MNnprRtUvz:Z'
+CP_SUB_ARGS = 'a:AcDeIL:MNnpPrRs:tUvz:Z'
 
 
 def _CopyFuncWrapper(cls, args, thread_state=None):
-  cls.CopyFunc(args, thread_state=thread_state)
+  cls.CopyFunc(args, thread_state=thread_state,
+               preserve_posix=cls.preserve_posix_attrs)
 
 
 def _CopyExceptionHandler(cls, e):
@@ -770,7 +808,8 @@ class CpCommand(Command):
   )
 
   # pylint: disable=too-many-statements
-  def CopyFunc(self, name_expansion_result, thread_state=None):
+  def CopyFunc(self, name_expansion_result, thread_state=None,
+               preserve_posix=False):
     """Worker function for performing the actual copy (and rm, for mv)."""
     gsutil_api = GetCloudApiInstance(self, thread_state=thread_state)
 
@@ -788,6 +827,8 @@ class CpCommand(Command):
       raise CommandException(
           'The %s command does not allow provider-only source URLs (%s)' %
           (cmd_name, src_url))
+    if preserve_posix and src_url.IsFileUrl() and src_url.IsStream():
+      raise CommandException('Cannot preserve POSIX attributes with a stream.')
     if have_multiple_srcs:
       copy_helper.InsistDstUrlNamesContainer(
           self.exp_dst_url, self.have_existing_dst_container, cmd_name)
@@ -833,7 +874,7 @@ class CpCommand(Command):
     dst_url = copy_helper.ConstructDstUrl(
         src_url, exp_src_url, src_url_names_container, have_multiple_srcs,
         self.exp_dst_url, self.have_existing_dst_container,
-        self.recursion_requested)
+        self.recursion_requested, preserve_posix=preserve_posix)
     dst_url = copy_helper.FixWindowsNaming(src_url, dst_url)
 
     copy_helper.CheckForDirFileConflict(exp_src_url, dst_url)
@@ -846,17 +887,54 @@ class CpCommand(Command):
                              'the destination for gsutil cp - abort.'
                              % (cmd_name, dst_url))
 
-    elapsed_time = bytes_transferred = 0
+    if not dst_url.IsCloudUrl() and copy_helper_opts.dest_storage_class:
+      raise CommandException('Cannot specify storage class for a non-cloud '
+                             'destination: %s' % dst_url)
+
+    src_obj_metadata = None
+    if name_expansion_result.expanded_result:
+      src_obj_metadata = encoding.JsonToMessage(
+          apitools_messages.Object, name_expansion_result.expanded_result)
+
+    if src_url.IsFileUrl() and preserve_posix:
+      if not src_obj_metadata:
+        src_obj_metadata = apitools_messages.Object()
+      mode, _, _, _, uid, gid, _, atime, mtime, _ = os.stat(
+          exp_src_url.object_name)
+      mode = ConvertModeToBase8(mode)
+      posix_attrs = POSIXAttributes(atime=atime, mtime=mtime, uid=uid, gid=gid,
+                                    mode=mode)
+      custom_metadata = apitools_messages.Object.MetadataValue(
+          additionalProperties=[])
+      SerializeFileAttributesToObjectMetadata(posix_attrs, custom_metadata,
+                                              preserve_posix=preserve_posix)
+      src_obj_metadata.metadata = custom_metadata
+
+    if src_obj_metadata and dst_url.IsFileUrl():
+      posix_attrs = DeserializeFileAttributesFromObjectMetadata(
+          src_obj_metadata, src_url.url_string)
+      mode = posix_attrs.mode.permissions
+      valid, err = ValidateFilePermissionAccess(src_url.url_string,
+                                                uid=posix_attrs.uid,
+                                                gid=posix_attrs.gid,
+                                                mode=mode)
+      if preserve_posix and not valid:
+        logging.getLogger().critical(err)
+        raise CommandException('This sync will orphan file(s), please fix their'
+                               ' permissions before trying again.')
+
+    bytes_transferred = 0
     try:
       if copy_helper_opts.use_manifest:
         self.manifest.Initialize(
             exp_src_url.url_string, dst_url.url_string)
-      (elapsed_time, bytes_transferred, result_url, md5) = (
+      (_, bytes_transferred, result_url, md5) = (
           copy_helper.PerformCopy(
               self.logger, exp_src_url, dst_url, gsutil_api,
-              self, _CopyExceptionHandler, allow_splitting=True,
-              headers=self.headers, manifest=self.manifest,
-              gzip_exts=self.gzip_exts))
+              self, _CopyExceptionHandler, src_obj_metadata=src_obj_metadata,
+              allow_splitting=True, headers=self.headers,
+              manifest=self.manifest, gzip_exts=self.gzip_exts,
+              preserve_posix=preserve_posix))
       if copy_helper_opts.use_manifest:
         if md5:
           self.manifest.Set(exp_src_url.url_string, 'md5', md5)
@@ -915,15 +993,19 @@ class CpCommand(Command):
           os.unlink(exp_src_url.object_name)
 
     with self.stats_lock:
-      self.total_elapsed_time += elapsed_time
+      # TODO: Remove stats_lock; we should be able to calculate bytes
+      # transferred from StatusMessages posted by operations within PerformCopy.
       self.total_bytes_transferred += bytes_transferred
 
   # Command entry point.
   def RunCommand(self):
     copy_helper_opts = self._ParseOpts()
 
-    self.total_elapsed_time = self.total_bytes_transferred = 0
+    self.total_bytes_transferred = 0
     if self.args[-1] == '-' or self.args[-1] == 'file://-':
+      if self.preserve_posix_attrs:
+        raise CommandException('Cannot preserve POSIX attributes with a '
+                               'stream.')
       return CatHelper(self).CatUrlStrings(self.args[:-1])
 
     if copy_helper_opts.read_args_from_stdin:
@@ -944,7 +1026,30 @@ class CpCommand(Command):
         self.logger, self.gsutil_api, url_strs,
         self.recursion_requested or copy_helper_opts.perform_mv,
         project_id=self.project_id, all_versions=self.all_versions,
-        continue_on_error=self.continue_on_error or self.parallel_operations)
+        ignore_symlinks=self.exclude_symlinks,
+        continue_on_error=self.continue_on_error or self.parallel_operations,
+        bucket_listing_fields=GetSourceFieldsNeededForCopy(
+            self.exp_dst_url.IsCloudUrl(),
+            copy_helper_opts.skip_unsupported_objects,
+            copy_helper_opts.preserve_acl,
+            preserve_posix=self.preserve_posix_attrs,
+            delete_source=copy_helper_opts.perform_mv))
+    # Because cp may have multiple source URLs, we wrap the name expansion
+    # iterator in order to collect analytics.
+    name_expansion_iterator = SourceUrlTypeIterator(
+        name_expansion_iterator=name_expansion_iterator,
+        is_daisy_chain=copy_helper_opts.daisy_chain,
+        dst_url=self.exp_dst_url)
+
+    seek_ahead_iterator = None
+    # Cannot seek ahead with stdin args, since we can only iterate them
+    # once without buffering in memory.
+    if not copy_helper_opts.read_args_from_stdin:
+      seek_ahead_iterator = SeekAheadNameExpansionIterator(
+          self.command_name, self.debug, self.GetSeekAheadGsutilApi(),
+          url_strs, self.recursion_requested or copy_helper_opts.perform_mv,
+          all_versions=self.all_versions, project_id=self.project_id,
+          ignore_symlinks=self.exclude_symlinks)
 
     # Use a lock to ensure accurate statistics in the face of
     # multi-threading/multi-processing.
@@ -965,23 +1070,24 @@ class CpCommand(Command):
     # perform requests with sequential function calls in current process.
     self.Apply(_CopyFuncWrapper, name_expansion_iterator,
                _CopyExceptionHandler, shared_attrs,
-               fail_on_error=(not self.continue_on_error))
+               fail_on_error=(not self.continue_on_error),
+               seek_ahead_iterator=seek_ahead_iterator)
     self.logger.debug(
         'total_bytes_transferred: %d', self.total_bytes_transferred)
 
     end_time = time.time()
     self.total_elapsed_time = end_time - start_time
-
-    # Sometimes, particularly when running unit tests, the total elapsed time
-    # is really small. On Windows, the timer resolution is too small and
-    # causes total_elapsed_time to be zero.
-    try:
-      float(self.total_bytes_transferred) / float(self.total_elapsed_time)
-    except ZeroDivisionError:
-      self.total_elapsed_time = 0.01
-
-    self.total_bytes_per_second = (float(self.total_bytes_transferred) /
-                                   float(self.total_elapsed_time))
+    self.total_bytes_per_second = CalculateThroughput(
+        self.total_bytes_transferred, self.total_elapsed_time)
+    LogPerformanceSummaryParams(
+        has_file_dst=self.exp_dst_url.IsFileUrl(),
+        has_cloud_dst=self.exp_dst_url.IsCloudUrl(),
+        avg_throughput=self.total_bytes_per_second,
+        total_bytes_transferred=self.total_bytes_transferred,
+        total_elapsed_time=self.total_elapsed_time,
+        uses_fan=self.parallel_operations,
+        is_daisy_chain=copy_helper_opts.daisy_chain,
+        provider_types=[self.exp_dst_url.scheme])
 
     if self.debug >= DEBUGLEVEL_DUMP_REQUESTS:
       # Note that this only counts the actual GET and PUT bytes for the copy
@@ -1000,6 +1106,7 @@ class CpCommand(Command):
     return 0
 
   def _ParseOpts(self):
+    # TODO: Arrange variables initialized here in alphabetical order.
     perform_mv = False
     # exclude_symlinks is handled by Command parent class, so save in Command
     # state rather than CopyHelperOpts.
@@ -1013,6 +1120,7 @@ class CpCommand(Command):
     print_ver = False
     use_manifest = False
     preserve_acl = False
+    self.preserve_posix_attrs = False
     canned_acl = None
     # canned_acl is handled by a helper function in parent
     # Command class, so save in Command state rather than CopyHelperOpts.
@@ -1027,6 +1135,7 @@ class CpCommand(Command):
     gzip_arg_all = None
 
     test_callback_file = None
+    dest_storage_class = None
 
     # self.recursion_requested initialized in command.py (so can be checked
     # in parent class for all commands).
@@ -1063,8 +1172,13 @@ class CpCommand(Command):
           no_clobber = True
         elif o == '-p':
           preserve_acl = True
+        elif o == '-P':
+          self.preserve_posix_attrs = True
+          InitializeUserGroups()
         elif o == '-r' or o == '-R':
           self.recursion_requested = True
+        elif o == '-s':
+          dest_storage_class = NormalizeStorageClass(a)
         elif o == '-U':
           self.skip_unsupported_objects = True
         elif o == '-v':
@@ -1096,4 +1210,5 @@ class CpCommand(Command):
         preserve_acl=preserve_acl,
         canned_acl=canned_acl,
         skip_unsupported_objects=self.skip_unsupported_objects,
-        test_callback_file=test_callback_file)
+        test_callback_file=test_callback_file,
+        dest_storage_class=dest_storage_class)

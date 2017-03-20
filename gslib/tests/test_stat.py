@@ -20,6 +20,8 @@ from gslib.cs_api_map import ApiSelector
 from gslib.exception import NO_URLS_MATCHED_TARGET
 import gslib.tests.testcase as testcase
 from gslib.tests.testcase.integration_testcase import SkipForS3
+from gslib.tests.testcase.integration_testcase import SkipForXML
+from gslib.tests.util import GenerationFromURI as urigen
 from gslib.tests.util import ObjectToURI as suri
 from gslib.tests.util import SetBotoConfigForTest
 from gslib.tests.util import TEST_ENCRYPTION_CONTENT1
@@ -41,6 +43,29 @@ from gslib.util import Retry
 
 class TestStat(testcase.GsUtilIntegrationTestCase):
   """Integration tests for stat command."""
+
+  @SkipForS3('\'Archived time\' is a GS-specific response field.')
+  @SkipForXML(
+      'XML API only supports \'DeletedTime\' response field when making a '
+      'GET Bucket request to list all objects, which is heavy overhead when '
+      'the real intent is just a HEAD Object call.'
+  )
+  def test_versioned_stat_output(self):
+    """Tests stat output of an outdated object under version control."""
+    bucket_uri = self.CreateVersionedBucket()
+    old_object_uri = self.CreateObject(
+        bucket_uri=bucket_uri, contents='z')
+
+    # Update object
+    self.CreateObject(
+        bucket_uri=bucket_uri,
+        object_name=old_object_uri.object_name,
+        contents='z', gs_idempotent_generation=urigen(old_object_uri))
+
+    stdout = self.RunGsUtil(
+        ['stat', old_object_uri.version_specific_uri], return_stdout=True)
+
+    self.assertIn('Archived time', stdout)
 
   def test_stat_output(self):
     """Tests stat output of a single object."""
@@ -64,10 +89,14 @@ class TestStat(testcase.GsUtilIntegrationTestCase):
       if self.test_api == ApiSelector.XML:
         self.assertIn('Cache-Control:', stdout)
         self.assertIn('Content-Encoding:', stdout)
+      # TODO: Remove JSON check after adding storage class parsing in Boto.
+      elif self.test_api == ApiSelector.JSON:
+        self.assertIn('Storage class:', stdout)
       self.assertIn('Generation:', stdout)
       self.assertIn('Metageneration:', stdout)
       self.assertIn('Hash (crc32c):', stdout)
       self.assertIn('Hash (md5):', stdout)
+      self.assertNotIn('Archived time', stdout)  # object is not archived
     self.assertIn('Content-Length:', stdout)
     self.assertIn('Content-Type:', stdout)
     self.assertIn('ETag:', stdout)

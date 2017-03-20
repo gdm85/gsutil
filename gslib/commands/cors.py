@@ -18,6 +18,7 @@ from __future__ import absolute_import
 
 import sys
 
+from gslib import metrics
 from gslib.command import Command
 from gslib.command_argument import CommandArgument
 from gslib.cs_api_map import ApiSelector
@@ -33,11 +34,11 @@ from gslib.util import UrlsAreForSingleProvider
 
 
 _GET_SYNOPSIS = """
-gsutil cors get url
+  gsutil cors get url
 """
 
 _SET_SYNOPSIS = """
-gsutil cors set cors-json-file url...
+  gsutil cors set cors-json-file url...
 """
 
 _GET_DESCRIPTION = """
@@ -122,7 +123,7 @@ class CorsCommand(Command):
       help_name_aliases=['getcors', 'setcors', 'cross-origin'],
       help_type='command_help',
       help_one_line_summary=(
-          'Set a CORS JSON document for one or more buckets'),
+          'Get or set a CORS JSON document for one or more buckets'),
       help_text=_DETAILED_HELP_TEXT,
       subcommand_help_text={'get': _get_help_text, 'set': _set_help_text},
   )
@@ -201,4 +202,5 @@ class CorsCommand(Command):
       raise CommandException(('Invalid subcommand "%s" for the %s command.\n'
                               'See "gsutil help cors".') %
                              (action_subcommand, self.command_name))
+    metrics.LogCommandParams(subcommands=[action_subcommand])
     return func()
