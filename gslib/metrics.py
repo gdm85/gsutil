@@ -295,9 +295,7 @@ class MetricsCollector(object):
   @staticmethod
   def IsDisabled():
     """Returns whether metrics collection should be disabled."""
-    if MetricsCollector._disabled_cache is None:
-      MetricsCollector._CheckAndSetDisabledCache()
-    return MetricsCollector._disabled_cache
+    return True
 
   @classmethod
   def _CheckAndSetDisabledCache(cls):
